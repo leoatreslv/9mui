@@ -4,6 +4,8 @@ import os
 from datetime import datetime, timedelta
 from html import escape
 
+__version__ = "0.1"
+
 import pytz
 from config import load_config
 from database import init_db, get_session, Thought, Reminder

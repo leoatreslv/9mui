@@ -1,5 +1,7 @@
 FROM python:3.12-slim
 
+LABEL version="0.1"
+
 WORKDIR /app
 
 COPY requirements.txt .
