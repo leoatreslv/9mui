@@ -19,6 +19,36 @@ from platforms.base import BasePlatform
 logger = logging.getLogger(__name__)
 _HTML = "HTML"
 
+_HELP_TEXT = """\
+<b>9Mui — Personal Reminder Bot</b>
+<i>v{version}</i>
+
+<b>How to use</b>
+Just send any thought or task — I'll remind you on a schedule.
+
+<b>Examples</b>
+  • <i>Buy milk</i> — remind every 8h (default)
+  • <i>Call dentist — remind me at 4pm</i>
+  • <i>remind me to get off plane in 5 mins</i>
+  • <i>remind me to submit report tomorrow 9am</i>
+  • <i>Meeting notes by 3pm</i>
+
+<b>Traditional Chinese</b>
+  • <i>提醒我明天下午4點打電話給醫生</i>
+  • <i>提醒我5分鐘後下飛機</i>
+  • <i>幫我提醒明天早上9點開會</i>
+  • <i>叫老婆買菜 明天下午3點</i>
+
+<b>Commands</b>
+  /list — show all pending reminders
+  /help — show this help message
+
+<b>Reminder actions</b>
+  ✅ Done — mark complete, cancel future reminders
+  ⏰ Snooze 2h / 8h — delay the next reminder
+  🗑️ Delete — permanently delete
+"""
+
 
 def _esc(text: str) -> str:
     return escape(str(text))
@@ -26,12 +56,14 @@ def _esc(text: str) -> str:
 
 class TelegramPlatform(BasePlatform):
     def __init__(self, cfg, on_message: Callable, send_reminder_fn: Callable,
-                 get_pending_items: Callable = None, timezone: str = "UTC"):
+                 get_pending_items: Callable = None, timezone: str = "UTC",
+                 version: str = ""):
         self._token = cfg.token
         self._allowed = set(cfg.allowed_chat_ids)
         self._on_message = on_message
         self._get_pending_items = get_pending_items
         self._tz = pytz.timezone(timezone)
+        self._version = version
         self._app = None
 
     def _is_allowed(self, chat_id: str) -> bool:
@@ -57,6 +89,7 @@ class TelegramPlatform(BasePlatform):
         self._app = Application.builder().token(self._token).build()
 
         self._app.add_handler(CommandHandler("start", self._handle_start))
+        self._app.add_handler(CommandHandler("help", self._handle_help))
         self._app.add_handler(CommandHandler("list", self._handle_list))
         self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
         self._app.add_handler(CallbackQueryHandler(self._handle_callback))
@@ -73,12 +106,17 @@ class TelegramPlatform(BasePlatform):
         if not self._is_allowed(str(update.effective_chat.id)):
             return
         await update.message.reply_text(
-            "👋 Hi! Send me anything you want to remember.\n\n"
-            "I'll remind you every 8 hours by default, or you can say:\n"
-            "  • <i>Buy milk — remind me at 4pm</i>\n"
-            "  • <i>Call dentist — remind me in 2 hours</i>\n"
-            "  • <i>Review PR — remind me tomorrow 9am</i>\n"
-            "  • <i>remind me to get off plane in 5 mins</i>",
+            "👋 Hi! I'm 9Mui, your personal reminder bot.\n\n"
+            "Send me anything you want to remember and I'll remind you.\n\n"
+            "Type /help to see all commands and examples.",
+            parse_mode=_HTML,
+        )
+
+    async def _handle_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not self._is_allowed(str(update.effective_chat.id)):
+            return
+        await update.message.reply_text(
+            _HELP_TEXT.format(version=self._version or "—"),
             parse_mode=_HTML,
         )
 

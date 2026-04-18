@@ -155,7 +155,7 @@ async def main():
     init_db(db_path)
     init_scheduler(db_path, send_reminder)
 
-    platform = load_platform(cfg, on_message, send_reminder, get_pending_items)
+    platform = load_platform(cfg, on_message, send_reminder, get_pending_items, __version__)
     await platform.run()
 
 

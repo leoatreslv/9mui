@@ -3,11 +3,12 @@ from platforms.base import BasePlatform
 
 
 def load_platform(cfg: AppConfig, on_message, send_reminder_fn,
-                  get_pending_items=None) -> BasePlatform:
+                  get_pending_items=None, version: str = "") -> BasePlatform:
     """Factory: returns the configured platform instance."""
     if cfg.platform == "telegram":
         from platforms.telegram import TelegramPlatform
-        return TelegramPlatform(cfg.telegram, on_message, send_reminder_fn, get_pending_items, cfg.timezone)
+        return TelegramPlatform(cfg.telegram, on_message, send_reminder_fn,
+                                get_pending_items, cfg.timezone, version)
 
     # Future platforms:
     # if cfg.platform == "discord":
