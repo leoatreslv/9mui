@@ -1,8 +1,11 @@
 # 9Mui — Personal Reminder Bot
 
 ![Version](https://img.shields.io/badge/version-0.1-blue)
+![Docker Pulls](https://img.shields.io/docker/pulls/wongleo/reminder-bot)
 
 A self-hosted thought-capture and reminder bot. Send it anything you want to remember — it stores it and reminds you at the right time. Runs on Telegram, deployed via Docker.
+
+**No AI required.** This bot runs entirely on your own machine with no external AI services, API keys, or subscriptions. Just a Telegram bot token and Docker.
 
 ## Features
 
@@ -13,6 +16,8 @@ A self-hosted thought-capture and reminder bot. Send it anything you want to rem
 - **Extensible** — platform abstraction ready for Discord, WhatsApp, LINE
 
 ## Quick Start
+
+The Docker image is publicly available on Docker Hub — no need to build anything.
 
 **1. Get a Telegram bot token**
 
@@ -44,11 +49,14 @@ reminder:
 timezone: "Asia/Singapore"   # your timezone
 ```
 
-**4. Run**
+**4. Pull the image and run**
 
 ```bash
+docker pull wongleo/reminder-bot
 docker compose up -d
 ```
+
+> The image is hosted on [Docker Hub](https://hub.docker.com/r/wongleo/reminder-bot). No build step needed.
 
 ## Usage
 
