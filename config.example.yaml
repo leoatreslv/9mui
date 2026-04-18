@@ -1,0 +1,39 @@
+# ─────────────────────────────────────────────
+# Reminder Bot — Configuration
+# Copy this file to config.yaml and fill in values.
+# ─────────────────────────────────────────────
+
+# Which chat platform to use: telegram | discord | whatsapp
+platform: telegram
+
+# ── Telegram ──────────────────────────────────
+telegram:
+  token: "YOUR_TELEGRAM_BOT_TOKEN"
+
+  # Restrict who can use the bot.
+  # List your numeric Telegram chat IDs. Leave empty (or omit) to allow everyone.
+  # To find your chat ID: message @userinfobot on Telegram.
+  allowed_chat_ids:
+    - 123456789   # replace with your actual ID
+  # - 987654321  # add more if needed
+
+# ── Discord (future) ──────────────────────────
+# discord:
+#   token: "YOUR_DISCORD_BOT_TOKEN"
+#   guild_id: "YOUR_GUILD_ID"
+
+# ── WhatsApp (future) ─────────────────────────
+# whatsapp:
+#   token: "YOUR_WHATSAPP_TOKEN"
+#   phone_number_id: "YOUR_PHONE_NUMBER_ID"
+#   verify_token: "YOUR_WEBHOOK_VERIFY_TOKEN"
+
+# ── Reminder defaults ─────────────────────────
+reminder:
+  # Hours between repeating reminders when no time is specified
+  default_interval_hours: 8
+
+# ── Timezone ──────────────────────────────────
+# Used when interpreting times like "at 4pm".
+# See full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+timezone: "UTC"

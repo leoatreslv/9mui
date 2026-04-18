@@ -1,0 +1,11 @@
+services:
+  reminder-bot:
+    build: .
+    container_name: reminder-bot
+    restart: unless-stopped          # auto-restarts after reboot
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro   # your config (read-only)
+      - ./data:/app/data                    # persistent SQLite storage
+    environment:
+      - CONFIG_PATH=/app/config.yaml
+      - DB_PATH=/app/data/reminders.db
