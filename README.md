@@ -59,9 +59,9 @@ Just send a message to your bot:
 | `remind me to get off plane in 5 mins` | Reminded in 5 minutes |
 | `remind me to call dentist at 4pm` | Reminded once at 4pm |
 | `Meeting notes by 3pm` | Reminded once at 3pm |
-| `提醒我明天下午4点打电话给医生` | Reminded tomorrow at 4pm |
-| `提醒我5分钟后下飞机` | Reminded in 5 minutes |
-| `叫老婆买菜 明天下午3点` | Reminded tomorrow at 3pm |
+| `提醒我明天下午4點打電話給醫生` | Reminded tomorrow at 4pm |
+| `提醒我5分鐘後下飛機` | Reminded in 5 minutes |
+| `叫老婆買菜 明天下午3點` | Reminded tomorrow at 3pm |
 
 **Commands:**
 
@@ -86,12 +86,12 @@ Just send a message to your bot:
 - `remind me to X [time]`, `remind me at [time]`
 
 **Chinese:**
-- `明天下午4点` (tomorrow 4pm)
-- `今天早上9点` (today 9am)
-- `下午3点` (3pm)
-- `5分钟后` (in 5 minutes)
-- `1小时后` (in 1 hour)
-- `提醒我...`, `帮我提醒...`, `提醒一下...`
+- `明天下午4點` (tomorrow 4pm)
+- `今天早上9點` (today 9am)
+- `下午3點` (3pm)
+- `5分鐘後` (in 5 minutes)
+- `1小時後` (in 1 hour)
+- `提醒我...`, `幫我提醒...`, `提醒一下...`
 
 ## Configuration Reference
 
