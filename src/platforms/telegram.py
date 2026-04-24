@@ -4,7 +4,14 @@ from html import escape
 from typing import Callable
 import pytz
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    BotCommand,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -48,6 +55,22 @@ Just send any thought or task — I'll remind you on a schedule.
   ⏰ Snooze 2h / 8h — delay the next reminder
   🗑️ Delete — permanently delete
 """
+
+
+_BTN_LIST = "📋 My reminders"
+_BTN_HELP = "❓ Help"
+
+_REPLY_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton(_BTN_LIST), KeyboardButton(_BTN_HELP)]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+_BOT_COMMANDS = [
+    BotCommand("list", "Show pending reminders"),
+    BotCommand("help", "Show help and examples"),
+    BotCommand("start", "Welcome message"),
+]
 
 
 def _esc(text: str) -> str:
@@ -96,6 +119,7 @@ class TelegramPlatform(BasePlatform):
 
         logger.info("Telegram bot starting (polling)...")
         async with self._app:
+            await self._app.bot.set_my_commands(_BOT_COMMANDS)
             await self._app.start()
             await self._app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
             await asyncio.get_event_loop().create_future()  # run forever
@@ -110,6 +134,7 @@ class TelegramPlatform(BasePlatform):
             "Send me anything you want to remember and I'll remind you.\n\n"
             "Type /help to see all commands and examples.",
             parse_mode=_HTML,
+            reply_markup=_REPLY_KEYBOARD,
         )
 
     async def _handle_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -118,6 +143,7 @@ class TelegramPlatform(BasePlatform):
         await update.message.reply_text(
             _HELP_TEXT.format(version=self._version or "—"),
             parse_mode=_HTML,
+            reply_markup=_REPLY_KEYBOARD,
         )
 
     async def _handle_list(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -155,6 +181,12 @@ class TelegramPlatform(BasePlatform):
         if not self._is_allowed(chat_id):
             return
         text = update.message.text.strip()
+        if text == _BTN_LIST:
+            await self._handle_list(update, ctx)
+            return
+        if text == _BTN_HELP:
+            await self._handle_help(update, ctx)
+            return
         reply = await self._on_message(chat_id, text)
         if reply:
             await update.message.reply_text(reply, parse_mode=_HTML)
