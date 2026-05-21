@@ -78,13 +78,70 @@ Just send a message to your bot:
 | Command | Action |
 |---|---|
 | `/list` | Show all pending reminders with Done / Delete buttons |
-| `/start` | Show help |
+| `/opp` | Sales-opportunity tracker (see section below) |
+| `/help` | Show in-bot help |
+| `/start` | Welcome message |
 
 **Reminder actions (inline buttons):**
 
 - **✅ Done** — mark complete and cancel future reminders
 - **⏰ Snooze 2h / 8h** — delay the reminder
 - **🗑️ Delete** — permanently delete the reminder
+
+## Sales Opportunities
+
+Track deals in progress alongside your reminders. Each opportunity has
+a title, customer, stage (`lead → qualified → proposal → won | lost`),
+and an append-only update log.
+
+| Command | Action |
+|---|---|
+| `/opp new <title> [--customer=<name>]` | Create a new opportunity |
+| `/opp update <id> <note>` | Append a timestamped update |
+| `/opp stage <id> <stage>` | Change stage (also logs an audit entry) |
+| `/opp show <id>` | Show one opportunity with full update history |
+| `/opp list [md] [stage]` | List opportunities (cards by default; `md` = markdown table; optional stage filter) |
+| `/opp export csv` | Send a UTF-8-with-BOM CSV file as a Telegram attachment (Excel-friendly) |
+| `/opp delete <id>` | Soft-delete (row stays in DB, filtered out of list) |
+| `/opp help` | Show this list inside Telegram |
+
+**Examples:**
+
+```
+/opp new Acme Q1 renewal --customer=Acme Corp
+/opp update 1 Met with Bob, looking good
+/opp stage 1 proposal
+/opp list
+/opp list won
+/opp list md
+/opp export csv
+```
+
+**Inline buttons on each card:**
+
+- **📝 Update** — bot prompts (ForceReply); your next reply becomes the update note
+- **▶ Advance** — move to the next stage (`lead → qualified → proposal → won`)
+- **🗑️ Delete** — soft-delete
+
+Stages are validated; `/opp stage 5 wun` is rejected. Stage changes
+also write a real update row (`stage: proposal → won`) so the history
+in `/opp show` and the CSV export is complete.
+
+Opportunities are scoped to your Telegram chat ID — if the bot has
+multiple `allowed_chat_ids`, users cannot see or modify each other's
+opportunities.
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+PYTHONPATH=src python -m pytest tests -q
+```
+
+Tests cover the `/opp` command parser, the service layer (CRUD,
+multi-user isolation, stage transitions, soft-delete), and the
+formatters (cards, markdown table, CSV export shape with escaped
+quotes/commas/newlines).
 
 ## Supported Time Expressions
 
@@ -142,15 +199,19 @@ class MyPlatform(BasePlatform):
 
 ```
 ├── src/
-│   ├── main.py              # message routing, reminder callbacks
+│   ├── main.py              # message routing, reminder + /opp callbacks
 │   ├── config.py            # config loader
-│   ├── database.py          # SQLAlchemy models (Thought, Reminder)
+│   ├── database.py          # SQLAlchemy models (Thought/Reminder/Opportunity)
 │   ├── scheduler.py         # APScheduler wrapper
 │   ├── time_parser.py       # NLP time extraction (EN + ZH)
+│   ├── opp.py               # /opp parser, service, formatters (cards/md/CSV)
 │   └── platforms/
 │       ├── base.py          # abstract platform interface
 │       └── telegram.py      # Telegram implementation
+├── tests/                   # pytest suite
 ├── config.example.yaml
+├── requirements.txt
+├── requirements-dev.txt
 ├── docker-compose.yml
 └── Dockerfile
 ```

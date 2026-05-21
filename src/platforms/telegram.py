@@ -1,10 +1,17 @@
 import asyncio
+import io
 import logging
 from html import escape
 from typing import Callable
 import pytz
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ForceReply,
+    InputFile,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -41,6 +48,7 @@ Just send any thought or task — I'll remind you on a schedule.
 
 <b>Commands</b>
   /list — show all pending reminders
+  /opp — sales opportunity tracker (try <i>/opp help</i>)
   /help — show this help message
 
 <b>Reminder actions</b>
@@ -91,6 +99,7 @@ class TelegramPlatform(BasePlatform):
         self._app.add_handler(CommandHandler("start", self._handle_start))
         self._app.add_handler(CommandHandler("help", self._handle_help))
         self._app.add_handler(CommandHandler("list", self._handle_list))
+        self._app.add_handler(CommandHandler("opp", self._handle_text))
         self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
         self._app.add_handler(CallbackQueryHandler(self._handle_callback))
 
@@ -155,9 +164,18 @@ class TelegramPlatform(BasePlatform):
         if not self._is_allowed(chat_id):
             return
         text = update.message.text.strip()
-        reply = await self._on_message(chat_id, text)
-        if reply:
-            await update.message.reply_text(reply, parse_mode=_HTML)
+
+        # /list and /help are handled by their own CommandHandlers above.
+        # Other commands (notably /opp) and free text both come here.
+        # We intentionally don't strip the leading slash because the
+        # router in main.on_message dispatches by full command string.
+
+        reply_to_text = None
+        if update.message.reply_to_message and update.message.reply_to_message.text:
+            reply_to_text = update.message.reply_to_message.text
+
+        reply = await self._on_message(chat_id, text, reply_to_text)
+        await self._render_reply(update, reply)
 
     async def _handle_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -168,5 +186,79 @@ class TelegramPlatform(BasePlatform):
         await query.answer()
 
         reply = await self._on_message(chat_id, f"/callback {query.data}")
-        if reply:
+
+        # ForceReply prompts can't be edited in place — we need a NEW
+        # message with the ForceReply markup. So send instead of edit
+        # in that case.
+        if isinstance(reply, dict) and reply.get("kind") == "force_reply":
+            await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=reply["text"],
+                parse_mode=_HTML,
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+
+        if isinstance(reply, str):
             await query.edit_message_text(reply, parse_mode=_HTML)
+            return
+
+        # For richer responses (cards/csv) from a callback, just send a
+        # new message via the normal renderer.
+        await self._render_reply_to_chat(chat_id, reply)
+
+    # ── Reply rendering ──────────────────────────────────────────────────
+
+    async def _render_reply(self, update: Update, reply) -> None:
+        if reply is None:
+            return
+        if isinstance(reply, str):
+            await update.message.reply_text(reply, parse_mode=_HTML)
+            return
+        await self._render_reply_to_chat(str(update.effective_chat.id), reply)
+
+    async def _render_reply_to_chat(self, chat_id: str, reply) -> None:
+        if not isinstance(reply, dict):
+            return
+
+        kind = reply.get("kind")
+
+        if kind == "opp_cards":
+            if reply.get("header"):
+                await self._app.bot.send_message(
+                    chat_id=chat_id, text=reply["header"], parse_mode=_HTML)
+            for item in reply["items"]:
+                buttons = [
+                    InlineKeyboardButton("📝 Update", callback_data=f"opp_update:{item['opp_id']}"),
+                ]
+                if item.get("can_advance"):
+                    buttons.append(InlineKeyboardButton("▶ Advance", callback_data=f"opp_advance:{item['opp_id']}"))
+                buttons.append(InlineKeyboardButton("🗑️ Delete", callback_data=f"opp_delete:{item['opp_id']}"))
+                await self._app.bot.send_message(
+                    chat_id=chat_id,
+                    text=item["text"],
+                    parse_mode=_HTML,
+                    reply_markup=InlineKeyboardMarkup([buttons]),
+                )
+            return
+
+        if kind == "csv":
+            doc = InputFile(io.BytesIO(reply["data"]), filename=reply["filename"])
+            await self._app.bot.send_document(
+                chat_id=chat_id,
+                document=doc,
+                caption=reply.get("caption", ""),
+                parse_mode=_HTML,
+            )
+            return
+
+        if kind == "force_reply":
+            await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=reply["text"],
+                parse_mode=_HTML,
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+
+        logger.warning("Unhandled reply kind: %r", kind)

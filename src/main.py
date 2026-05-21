@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 from html import escape
 
@@ -12,6 +13,20 @@ from database import init_db, get_session, Thought, Reminder
 from scheduler import init_scheduler, schedule_new_reminder, cancel_reminder, get_next_run_time
 from time_parser import parse_message
 from platforms import load_platform
+from opp import (
+    STAGE_ADVANCE,
+    parse_opp_command,
+    get_opp,
+    list_opps,
+    create_opp,
+    append_update,
+    change_stage,
+    soft_delete,
+    format_card,
+    format_show,
+    format_markdown_table,
+    build_csv,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,9 +42,18 @@ def _esc(text: str) -> str:
 cfg = load_config()
 platform = None  # set after init
 
+# ForceReply prompt that tags itself with the opp id, so we can pick up
+# the user's next reply without a stateful conversation handler.
+FORCEREPLY_TAG_RE = re.compile(r"opp\s+#(\d+)")
 
-async def on_message(chat_id: str, text: str) -> str:
-    """Central handler: called by any platform when a message arrives."""
+
+async def on_message(chat_id: str, text: str, reply_to_text: str | None = None) -> str | dict:
+    """Central handler: called by any platform when a message arrives.
+
+    Return value is either a string (plain reply) or a dict carrying a
+    structured action — currently used for sending CSV attachments and
+    cards-with-buttons.
+    """
 
     if text == "/list":
         items = get_pending_items(chat_id)
@@ -44,6 +68,16 @@ async def on_message(chat_id: str, text: str) -> str:
 
     if text.startswith("/callback "):
         return await _cmd_callback(chat_id, text[len("/callback "):])
+
+    if text.startswith("/opp"):
+        return await _handle_opp(chat_id, text)
+
+    # Treat as an update reply if the message replies to one of our
+    # ForceReply prompts containing "opp #<id>".
+    if reply_to_text:
+        m = FORCEREPLY_TAG_RE.search(reply_to_text)
+        if m:
+            return await _handle_opp_force_reply(chat_id, int(m.group(1)), text)
 
     # Regular thought capture
     content, remind_at = parse_message(text, cfg.timezone)
@@ -97,7 +131,7 @@ def get_pending_items(chat_id: str) -> list[dict]:
         return items
 
 
-async def _cmd_callback(chat_id: str, data: str) -> str:
+async def _cmd_callback(chat_id: str, data: str) -> str | dict:
     parts = data.split(":")
 
     if parts[0] == "done":
@@ -141,7 +175,169 @@ async def _cmd_callback(chat_id: str, data: str) -> str:
 
         return f"⏰ Snoozed for {hours}h. I'll remind you at <b>{snooze_until.strftime('%H:%M')} UTC</b>."
 
+    # Opportunity actions: opp_advance:N, opp_update:N, opp_delete:N
+    if parts[0] == "opp_advance":
+        opp_id = int(parts[1])
+        with get_session() as session:
+            opp = get_opp(session, chat_id, opp_id)
+            if not opp:
+                return "❌ Opportunity not found (or already deleted)."
+            nxt = STAGE_ADVANCE.get(opp.stage)
+            if nxt is None:
+                return f"⚡ <b>#{opp_id}</b> is already <b>{opp.stage}</b> — no further advance."
+            change_stage(session, opp, nxt, by_chat_id=chat_id)
+            session.commit()
+            return f"▶ <b>#{opp_id}</b> advanced to <b>{nxt}</b>."
+
+    if parts[0] == "opp_delete":
+        opp_id = int(parts[1])
+        with get_session() as session:
+            opp = get_opp(session, chat_id, opp_id)
+            if not opp:
+                return "❌ Already deleted."
+            soft_delete(session, opp)
+            session.commit()
+            return f"🗑️ Opportunity <b>#{opp_id}</b> deleted."
+
+    if parts[0] == "opp_update":
+        opp_id = int(parts[1])
+        with get_session() as session:
+            opp = get_opp(session, chat_id, opp_id)
+            if not opp:
+                return "❌ Opportunity not found."
+            title = opp.title
+        return {
+            "kind": "force_reply",
+            "text": f"📝 Reply to this message with the update note for opp #{opp_id} ({_esc(title)}):",
+        }
+
     return "❓ Unknown action."
+
+
+# ── Opportunities ────────────────────────────────────────────────────────
+
+_OPP_HELP = """\
+<b>Sales opportunities</b>
+
+  /opp new <i>&lt;title&gt;</i> [--customer=<i>&lt;name&gt;</i>]
+  /opp update <i>&lt;id&gt;</i> <i>&lt;note&gt;</i>
+  /opp stage <i>&lt;id&gt;</i> <i>&lt;lead|qualified|proposal|won|lost&gt;</i>
+  /opp show <i>&lt;id&gt;</i>
+  /opp list [<i>md</i>] [<i>stage</i>]
+  /opp export csv
+  /opp delete <i>&lt;id&gt;</i>
+
+<b>Examples</b>
+  • <i>/opp new Acme Q1 renewal --customer=Acme Corp</i>
+  • <i>/opp update 5 Met with Bob, looking good</i>
+  • <i>/opp stage 5 proposal</i>
+  • <i>/opp list won</i>
+  • <i>/opp list md</i>
+"""
+
+
+async def _handle_opp(chat_id: str, text: str) -> str | dict:
+    action = parse_opp_command(text)
+
+    if action.kind == "help":
+        return _OPP_HELP
+
+    if action.kind == "invalid":
+        return f"❌ {_esc(action.error or 'Bad command. Try /opp help.')}"
+
+    if action.kind == "new":
+        with get_session() as session:
+            opp = create_opp(session, chat_id, action.title, action.customer)
+            session.commit()
+            tz = cfg.timezone
+            return (
+                f"✅ Opportunity <b>#{opp.id}</b> created.\n\n"
+                + format_card(opp, tz)
+            )
+
+    if action.kind == "update":
+        with get_session() as session:
+            opp = get_opp(session, chat_id, action.opp_id)
+            if not opp:
+                return f"❌ Opportunity #{action.opp_id} not found."
+            append_update(session, opp, action.note, by_chat_id=chat_id)
+            session.commit()
+            return f"📝 Update added to <b>#{opp.id}</b>."
+
+    if action.kind == "stage":
+        with get_session() as session:
+            opp = get_opp(session, chat_id, action.opp_id)
+            if not opp:
+                return f"❌ Opportunity #{action.opp_id} not found."
+            change_stage(session, opp, action.stage, by_chat_id=chat_id)
+            session.commit()
+            return f"⚡ <b>#{opp.id}</b> stage → <b>{action.stage}</b>."
+
+    if action.kind == "show":
+        with get_session() as session:
+            opp = get_opp(session, chat_id, action.opp_id)
+            if not opp:
+                return f"❌ Opportunity #{action.opp_id} not found."
+            return format_show(opp, cfg.timezone)
+
+    if action.kind == "delete":
+        with get_session() as session:
+            opp = get_opp(session, chat_id, action.opp_id)
+            if not opp:
+                return f"❌ Opportunity #{action.opp_id} not found."
+            soft_delete(session, opp)
+            session.commit()
+            return f"🗑️ Opportunity <b>#{opp.id}</b> deleted."
+
+    if action.kind == "list":
+        with get_session() as session:
+            opps = list_opps(session, chat_id, action.filter_stage)
+            if not opps:
+                tail = f" with stage <b>{action.filter_stage}</b>" if action.filter_stage else ""
+                return f"📭 No opportunities{tail}."
+
+            if action.list_format == "md":
+                md = format_markdown_table(opps, cfg.timezone)
+                return f"<pre>{_esc(md)}</pre>"
+
+            # cards: bundle so telegram.py can render inline buttons
+            return {
+                "kind": "opp_cards",
+                "header": f"📊 <b>{len(opps)} opportunit{'y' if len(opps)==1 else 'ies'}</b>"
+                          + (f" · stage <b>{action.filter_stage}</b>" if action.filter_stage else ""),
+                "items": [
+                    {
+                        "opp_id": o.id,
+                        "text": format_card(o, cfg.timezone),
+                        "can_advance": o.stage in STAGE_ADVANCE,
+                    }
+                    for o in opps
+                ],
+            }
+
+    if action.kind == "export":
+        with get_session() as session:
+            opps = list_opps(session, chat_id)
+            data = build_csv(opps, cfg.timezone)
+            return {
+                "kind": "csv",
+                "filename": f"opportunities-{datetime.utcnow().strftime('%Y%m%d')}.csv",
+                "data": data,
+                "caption": f"📎 Exported {len(opps)} opportunit{'y' if len(opps)==1 else 'ies'}.",
+            }
+
+    return "❓ Unhandled action."
+
+
+async def _handle_opp_force_reply(chat_id: str, opp_id: int, note: str) -> str:
+    """User replied to a ForceReply prompt tagged with opp #<id>."""
+    with get_session() as session:
+        opp = get_opp(session, chat_id, opp_id)
+        if not opp:
+            return f"❌ Opportunity #{opp_id} not found."
+        append_update(session, opp, note, by_chat_id=chat_id)
+        session.commit()
+        return f"📝 Update added to <b>#{opp_id}</b>."
 
 
 async def send_reminder(chat_id: str, content: str, reminder_id: int):
