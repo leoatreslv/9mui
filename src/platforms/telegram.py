@@ -11,6 +11,7 @@ from telegram import (
     InlineKeyboardMarkup,
     ForceReply,
     InputFile,
+    BotCommand,
 )
 from telegram.ext import (
     Application,
@@ -106,6 +107,12 @@ class TelegramPlatform(BasePlatform):
         logger.info("Telegram bot starting (polling)...")
         async with self._app:
             await self._app.start()
+            await self._app.bot.set_my_commands([
+                BotCommand("list", "Show pending reminders"),
+                BotCommand("opp", "Sales opportunity tracker"),
+                BotCommand("help", "Show help and examples"),
+                BotCommand("start", "Welcome message"),
+            ])
             await self._app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
             await asyncio.get_event_loop().create_future()  # run forever
 
