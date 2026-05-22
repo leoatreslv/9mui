@@ -77,16 +77,73 @@ Just send a message to your bot:
 
 | Command | Action |
 |---|---|
-| `/list` | Show all pending reminders with Done / Delete buttons |
+| `/list` | Show pending reminders |
 | `/opp` | Sales-opportunity tracker (see section below) |
-| `/help` | Show in-bot help |
-| `/start` | Welcome message |
+| `/invite` | Invite a secretary to help on your behalf (owner only) |
+| `/members` | Show your secretaries (owner) or your owner (secretary) |
+| `/revoke <chat_id>` | Revoke a secretary (owner only) |
+| `/leave` | Step down as a secretary |
+| `/whoami` | Show your role |
+| `/help` | In-bot help |
 
 **Reminder actions (inline buttons):**
 
 - **✅ Done** — mark complete and cancel future reminders
 - **⏰ Snooze 2h / 8h** — delay the reminder
 - **🗑️ Delete** — permanently delete the reminder
+
+## Secretaries
+
+You can invite other Telegram users to act as your secretaries — they
+help by adding reminders and managing your sales pipeline. Everything
+they do lands on **your** list; reminder pings go to **you**.
+
+### Inviting
+
+1. Run `/invite` — the bot replies with a deep-link valid for 24 hours.
+2. Send that link to the person you want to invite (DM, email, anywhere).
+3. They tap the link → Telegram opens → they tap **Start**.
+4. The bot confirms; you get a notification: "✅ Alice (…7421) accepted your invite."
+5. They're now your secretary.
+
+Caps: up to **5 active secretaries** per owner (configurable), up to **10
+pending invite tokens** at a time. Invites are single-use.
+
+⚠️ Anyone who opens the link within 24h becomes your secretary — don't
+forward it or post it publicly.
+
+### What a secretary can do
+
+| Action | Secretary | Owner |
+|---|---|---|
+| Send a free-text reminder ("Buy milk 4pm") | ✅ lands on owner's list, pings owner | ✅ |
+| `/list` | only reminders they themselves added | full list |
+| Mark done / snooze / delete a reminder | only on their own additions | any |
+| All `/opp` commands (new, update, stage, delete, export, list) | ✅ full assistant access | ✅ |
+| `/opp list` | sees owner's full pipeline | ✅ |
+| `/invite`, `/revoke` | ❌ | ✅ |
+| `/leave` | ✅ steps down | n/a |
+| `/whoami` | ✅ shows their owner | ✅ shows secretaries |
+
+Reminder cards delivered to the owner are prefixed `(via Alice)` so you
+always know who added what. Opportunity updates show the same
+attribution in `/opp show`, `/opp list md`, and the CSV export.
+
+### Revoking
+
+```
+/revoke 877247421
+```
+
+Revocation is a soft-delete: the secretary loses access immediately and
+any pending reminders they created (that haven't fired yet) are
+cancelled. Their past contributions remain in your data and continue to
+show "by Alice (former)".
+
+### Disabling invites
+
+Set `telegram.allow_invites: false` in `config.yaml` and restart. The
+`/invite` command will refuse for everyone.
 
 ## Sales Opportunities
 
@@ -199,22 +256,39 @@ class MyPlatform(BasePlatform):
 
 ```
 ├── src/
-│   ├── main.py              # message routing, reminder + /opp callbacks
+│   ├── main.py              # central router (reminders, /opp, /invite, callbacks)
 │   ├── config.py            # config loader
-│   ├── database.py          # SQLAlchemy models (Thought/Reminder/Opportunity)
+│   ├── database.py          # SQLAlchemy models (Thought / Reminder / Opportunity
+│   │                        #   / OpportunityUpdate / Secretary / Invite / SecretaryEvent)
+│   ├── migrations.py        # idempotent SQLite migrations (ALTER TABLE + backup)
+│   ├── secretary.py         # resolve_owner, invite lifecycle, format_actor, audit
 │   ├── scheduler.py         # APScheduler wrapper
 │   ├── time_parser.py       # NLP time extraction (EN + ZH)
 │   ├── opp.py               # /opp parser, service, formatters (cards/md/CSV)
 │   └── platforms/
 │       ├── base.py          # abstract platform interface
 │       └── telegram.py      # Telegram implementation
-├── tests/                   # pytest suite
+├── tests/                   # pytest suite (96 tests)
 ├── config.example.yaml
 ├── requirements.txt
 ├── requirements-dev.txt
 ├── docker-compose.yml
 └── Dockerfile
 ```
+
+## Database migration
+
+The first boot after upgrading to a release with the secretary feature
+will:
+
+1. Copy your existing `reminders.db` to `reminders.db.bak-pre-secretary`
+   (only if no backup exists yet)
+2. `ALTER TABLE thoughts ADD COLUMN created_by_chat_id TEXT` if it's missing
+3. Backfill `created_by_chat_id = chat_id` on all existing rows
+4. Create the new `secretaries`, `invites`, and `secretary_events` tables
+
+All steps are idempotent — restarting the bot doesn't repeat them. If
+you ever need to roll back, swap the backup file in for the live DB.
 
 ## Tech Stack
 

@@ -8,6 +8,12 @@ from typing import Optional
 class TelegramConfig:
     token: str
     allowed_chat_ids: list[int] = field(default_factory=list)
+    # Used to build invite deep-links: https://t.me/<bot_username>?start=...
+    bot_username: str = ""
+    # Master switch for the /invite command.
+    allow_invites: bool = True
+    # Per-owner cap on active (non-revoked) secretaries.
+    max_secretaries_per_owner: int = 5
 
 
 @dataclass
@@ -53,6 +59,9 @@ def load_config(path: str = None) -> AppConfig:
     if "telegram" in raw:
         tg = raw["telegram"].copy()
         tg.setdefault("allowed_chat_ids", [])
+        tg.setdefault("bot_username", "")
+        tg.setdefault("allow_invites", True)
+        tg.setdefault("max_secretaries_per_owner", 5)
         telegram = TelegramConfig(**tg)
 
     discord = None

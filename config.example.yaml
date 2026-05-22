@@ -10,12 +10,22 @@ platform: telegram
 telegram:
   token: "YOUR_TELEGRAM_BOT_TOKEN"
 
-  # Restrict who can use the bot.
-  # List your numeric Telegram chat IDs. Leave empty (or omit) to allow everyone.
-  # To find your chat ID: message @userinfobot on Telegram.
+  # @username of your bot (no @). Used to build secretary invite links:
+  # https://t.me/<bot_username>?start=<token>
+  bot_username: "your_bot_username"
+
+  # Owner chat IDs — people who can run the bot as themselves and invite
+  # secretaries. To find your chat ID: message @userinfobot on Telegram.
+  # If empty, /invite is rejected (bot has no defined owner).
   allowed_chat_ids:
     - 123456789   # replace with your actual ID
-  # - 987654321  # add more if needed
+  # - 987654321  # add more owners (each gets their own data + secretary pool)
+
+  # Master switch for /invite. Set to false to lock the bot down.
+  allow_invites: true
+
+  # Cap on active (non-revoked) secretaries per owner.
+  max_secretaries_per_owner: 5
 
 # ── Discord (future) ──────────────────────────
 # discord:

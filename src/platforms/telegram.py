@@ -32,30 +32,25 @@ _HELP_TEXT = """\
 <i>v{version}</i>
 
 <b>How to use</b>
-Just send any thought or task — I'll remind you on a schedule.
-
-<b>Examples</b>
-  • <i>Buy milk</i> — remind every 8h (default)
-  • <i>Call dentist — remind me at 4pm</i>
-  • <i>remind me to get off plane in 5 mins</i>
-  • <i>remind me to submit report tomorrow 9am</i>
-  • <i>Meeting notes by 3pm</i>
-
-<b>Traditional Chinese</b>
-  • <i>提醒我明天下午4點打電話給醫生</i>
-  • <i>提醒我5分鐘後下飛機</i>
-  • <i>幫我提醒明天早上9點開會</i>
-  • <i>叫老婆買菜 明天下午3點</i>
+Send any thought or task — I'll remind you. Or invite secretaries to add things on your behalf.
 
 <b>Commands</b>
-  /list — show all pending reminders
-  /opp — sales opportunity tracker (try <i>/opp help</i>)
-  /help — show this help message
+  /list      — show pending reminders
+  /opp       — sales opportunity tracker (try <i>/opp help</i>)
+  /invite    — invite a secretary (owner only)
+  /members   — list secretaries / show your owner
+  /revoke    — revoke a secretary (owner only)
+  /leave     — step down as a secretary
+  /whoami    — show your role
+  /help      — show this message
 
 <b>Reminder actions</b>
-  ✅ Done — mark complete, cancel future reminders
-  ⏰ Snooze 2h / 8h — delay the next reminder
-  🗑️ Delete — permanently delete
+  ✅ Done · ⏰ Snooze 2h / 8h · 🗑️ Delete
+
+<b>Time expressions</b>
+  • <i>at 4pm</i>, <i>by 3pm</i>, <i>in 2 hours</i>
+  • <i>tomorrow 9am</i>, <i>next Monday</i>
+  • <i>明天下午4點</i>, <i>5分鐘後</i>
 """
 
 
@@ -68,6 +63,9 @@ class TelegramPlatform(BasePlatform):
                  get_pending_items: Callable = None, timezone: str = "UTC",
                  version: str = ""):
         self._token = cfg.token
+        # allowed_chat_ids no longer gates everything — the message router
+        # uses resolve_owner() which considers both this list and the
+        # Secretary table. We still hold a copy for reference.
         self._allowed = set(cfg.allowed_chat_ids)
         self._on_message = on_message
         self._get_pending_items = get_pending_items
@@ -75,11 +73,19 @@ class TelegramPlatform(BasePlatform):
         self._version = version
         self._app = None
 
-    def _is_allowed(self, chat_id: str) -> bool:
-        return not self._allowed or int(chat_id) in self._allowed
+    # ── BasePlatform contract + small extension for owner notifications ──
 
     async def send_message(self, chat_id: str, text: str) -> None:
         await self._app.bot.send_message(chat_id=chat_id, text=text)
+
+    async def send_html(self, chat_id: str, text: str) -> None:
+        """Used by main.py to notify owners on invite-accept / leave."""
+        try:
+            await self._app.bot.send_message(
+                chat_id=int(chat_id), text=text, parse_mode=_HTML
+            )
+        except Exception as e:
+            logger.warning("send_html to %s failed: %s", chat_id, e)
 
     async def send_reminder(self, chat_id: str, content: str, reminder_id: int) -> None:
         keyboard = InlineKeyboardMarkup([[
@@ -97,10 +103,16 @@ class TelegramPlatform(BasePlatform):
     async def run(self) -> None:
         self._app = Application.builder().token(self._token).build()
 
+        # /start handled specially so we can pass invite tokens to the router.
         self._app.add_handler(CommandHandler("start", self._handle_start))
         self._app.add_handler(CommandHandler("help", self._handle_help))
-        self._app.add_handler(CommandHandler("list", self._handle_list))
-        self._app.add_handler(CommandHandler("opp", self._handle_text))
+        self._app.add_handler(CommandHandler("list", self._handle_command))
+        self._app.add_handler(CommandHandler("opp", self._handle_command))
+        self._app.add_handler(CommandHandler("invite", self._handle_command))
+        self._app.add_handler(CommandHandler("members", self._handle_command))
+        self._app.add_handler(CommandHandler("revoke", self._handle_command))
+        self._app.add_handler(CommandHandler("leave", self._handle_command))
+        self._app.add_handler(CommandHandler("whoami", self._handle_command))
         self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
         self._app.add_handler(CallbackQueryHandler(self._handle_callback))
 
@@ -109,94 +121,74 @@ class TelegramPlatform(BasePlatform):
             await self._app.start()
             await self._app.bot.set_my_commands([
                 BotCommand("list", "Show pending reminders"),
-                BotCommand("opp", "Sales opportunity tracker"),
-                BotCommand("help", "Show help and examples"),
-                BotCommand("start", "Welcome message"),
+                BotCommand("opp", "Sales opportunities"),
+                BotCommand("invite", "Invite a secretary"),
+                BotCommand("members", "Show secretaries / owner"),
+                BotCommand("revoke", "Revoke a secretary"),
+                BotCommand("leave", "Step down as secretary"),
+                BotCommand("whoami", "Show your role"),
+                BotCommand("help", "Help"),
+                BotCommand("start", "Welcome"),
             ])
             await self._app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-            await asyncio.get_event_loop().create_future()  # run forever
+            await asyncio.get_event_loop().create_future()
 
     # ── Handlers ──────────────────────────────────────────────────────────
 
     async def _handle_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not self._is_allowed(str(update.effective_chat.id)):
+        """/start may carry an invite token. Always route through main —
+        a token-bearing /start must bypass any access gate."""
+        chat_id = str(update.effective_chat.id)
+        first_name = update.effective_user.first_name if update.effective_user else None
+        args = update.message.text or "/start"
+
+        # When /start has no payload, send the welcome (after permission check).
+        if args.strip() in ("/start", "/start@"):
+            reply = await self._on_message(chat_id, "", None, first_name)
+            if reply == "":
+                # Unknown chat without an invite — still show a welcome so the
+                # user can paste a token if they have one.
+                await update.message.reply_text(
+                    "👋 Hi! I'm 9Mui. If you have an invite link, tap it instead of typing /start.\n"
+                    "Otherwise, /help.",
+                    parse_mode=_HTML,
+                )
+                return
+            await self._render_reply(update, reply)
             return
-        await update.message.reply_text(
-            "👋 Hi! I'm 9Mui, your personal reminder bot.\n\n"
-            "Send me anything you want to remember and I'll remind you.\n\n"
-            "Type /help to see all commands and examples.",
-            parse_mode=_HTML,
-        )
+
+        reply = await self._on_message(chat_id, args, None, first_name)
+        await self._render_reply(update, reply)
 
     async def _handle_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not self._is_allowed(str(update.effective_chat.id)):
-            return
         await update.message.reply_text(
             _HELP_TEXT.format(version=self._version or "—"),
             parse_mode=_HTML,
         )
 
-    async def _handle_list(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        chat_id = str(update.effective_chat.id)
-        if not self._is_allowed(chat_id):
-            return
-
-        items = self._get_pending_items(chat_id) if self._get_pending_items else []
-        if not items:
-            await update.message.reply_text("📭 You have no pending reminders.")
-            return
-
-        await update.message.reply_text(
-            f"📋 <b>{len(items)} pending reminder(s):</b>", parse_mode=_HTML)
-
-        for it in items:
-            if it["next_run"]:
-                nr = it["next_run"]
-                if nr.tzinfo is None:
-                    nr = pytz.utc.localize(nr)
-                next_str = nr.astimezone(self._tz).strftime("%Y-%m-%d %H:%M")
-            else:
-                next_str = "—"
-            recur = f"every {it['repeat_hours']}h" if it["repeat_hours"] else "once"
-            text = (f"📝 {_esc(it['content'])}\n"
-                    f"<i>{_esc(recur)} · next: {next_str}</i>")
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Done", callback_data=f"done:{it['reminder_id']}"),
-                InlineKeyboardButton("🗑️ Delete", callback_data=f"delete:{it['reminder_id']}"),
-            ]])
-            await update.message.reply_text(text, parse_mode=_HTML, reply_markup=keyboard)
+    async def _handle_command(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await self._handle_text(update, ctx)
 
     async def _handle_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_id = str(update.effective_chat.id)
-        if not self._is_allowed(chat_id):
-            return
-        text = update.message.text.strip()
-
-        # /list and /help are handled by their own CommandHandlers above.
-        # Other commands (notably /opp) and free text both come here.
-        # We intentionally don't strip the leading slash because the
-        # router in main.on_message dispatches by full command string.
+        text = (update.message.text or "").strip()
+        first_name = update.effective_user.first_name if update.effective_user else None
 
         reply_to_text = None
         if update.message.reply_to_message and update.message.reply_to_message.text:
             reply_to_text = update.message.reply_to_message.text
 
-        reply = await self._on_message(chat_id, text, reply_to_text)
+        reply = await self._on_message(chat_id, text, reply_to_text, first_name)
         await self._render_reply(update, reply)
 
     async def _handle_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         chat_id = str(update.effective_chat.id)
-        if not self._is_allowed(chat_id):
-            await query.answer()
-            return
+        first_name = update.effective_user.first_name if update.effective_user else None
         await query.answer()
 
-        reply = await self._on_message(chat_id, f"/callback {query.data}")
+        reply = await self._on_message(chat_id, f"/callback {query.data}", None, first_name)
 
-        # ForceReply prompts can't be edited in place — we need a NEW
-        # message with the ForceReply markup. So send instead of edit
-        # in that case.
         if isinstance(reply, dict) and reply.get("kind") == "force_reply":
             await self._app.bot.send_message(
                 chat_id=chat_id,
@@ -207,20 +199,25 @@ class TelegramPlatform(BasePlatform):
             return
 
         if isinstance(reply, str):
-            await query.edit_message_text(reply, parse_mode=_HTML)
+            if reply == "":
+                return
+            try:
+                await query.edit_message_text(reply, parse_mode=_HTML)
+            except Exception:
+                # The message may have been deleted (e.g. after /opp delete).
+                # Fall back to a new send so the user gets feedback.
+                await self._app.bot.send_message(chat_id=chat_id, text=reply, parse_mode=_HTML)
             return
 
-        # For richer responses (cards/csv) from a callback, just send a
-        # new message via the normal renderer.
         await self._render_reply_to_chat(chat_id, reply)
 
     # ── Reply rendering ──────────────────────────────────────────────────
 
     async def _render_reply(self, update: Update, reply) -> None:
-        if reply is None:
+        if reply is None or reply == "":
             return
         if isinstance(reply, str):
-            await update.message.reply_text(reply, parse_mode=_HTML)
+            await update.message.reply_text(reply, parse_mode=_HTML, disable_web_page_preview=True)
             return
         await self._render_reply_to_chat(str(update.effective_chat.id), reply)
 
@@ -229,6 +226,23 @@ class TelegramPlatform(BasePlatform):
             return
 
         kind = reply.get("kind")
+
+        if kind == "reminder_cards":
+            if reply.get("header"):
+                await self._app.bot.send_message(
+                    chat_id=chat_id, text=reply["header"], parse_mode=_HTML)
+            for item in reply["items"]:
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Done", callback_data=f"done:{item['reminder_id']}"),
+                    InlineKeyboardButton("🗑️ Delete", callback_data=f"delete:{item['reminder_id']}"),
+                ]])
+                await self._app.bot.send_message(
+                    chat_id=chat_id,
+                    text=item["text"],
+                    parse_mode=_HTML,
+                    reply_markup=keyboard,
+                )
+            return
 
         if kind == "opp_cards":
             if reply.get("header"):
