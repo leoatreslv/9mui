@@ -42,6 +42,23 @@ class TestNew:
         a = parse_opp_command("/opp new Deal --customer=Foo & Bar, Inc.")
         assert a.customer == "Foo & Bar, Inc."
 
+    def test_em_dash_from_ios_autocorrect_works(self):
+        """iOS autocorrects -- to em-dash. The parser should still match."""
+        a = parse_opp_command("/opp new Acme Q1 —customer=Acme Corp")
+        assert a.kind == "new"
+        assert a.title == "Acme Q1"
+        assert a.customer == "Acme Corp"
+
+    def test_en_dash_also_works(self):
+        a = parse_opp_command("/opp new Acme Q1 –customer=Acme Corp")
+        assert a.customer == "Acme Corp"
+        assert a.title == "Acme Q1"
+
+    def test_spaces_around_equals_are_tolerated(self):
+        a = parse_opp_command("/opp new Acme Q1 --customer = Acme Corp")
+        assert a.customer == "Acme Corp"
+        assert a.title == "Acme Q1"
+
     def test_empty_title_is_invalid(self):
         a = parse_opp_command("/opp new")
         assert a.kind == "invalid"

@@ -48,7 +48,10 @@ class OppAction:
     error: Optional[str] = None
 
 
-_CUSTOMER_RE = re.compile(r"\s*--customer=(.*)$", re.DOTALL)
+# Mobile keyboards (iOS especially) autocorrect "--" to an em-dash "—",
+# and sometimes en-dash "–". Accept all three so /opp new ... doesn't
+# silently fold the flag into the title.
+_CUSTOMER_RE = re.compile(r"\s*(?:--|—|–)\s*customer\s*=\s*(.*)$", re.DOTALL)
 
 
 def parse_opp_command(text: str) -> OppAction:
