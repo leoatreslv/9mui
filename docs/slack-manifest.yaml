@@ -1,0 +1,79 @@
+# Slack App Manifest for 9Mui Reminder Bot
+#
+# To install:
+#   1. Visit https://api.slack.com/apps
+#   2. Click "Create New App" → "From an app manifest"
+#   3. Pick your workspace
+#   4. Paste this YAML
+#   5. After creation:
+#        • Basic Information → Generate an app-level token with `connections:write`
+#          scope. Copy as `slack.app_token` (xapp-...) in config.yaml.
+#        • Install App → Install to workspace. Copy the Bot User OAuth Token
+#          as `slack.bot_token` (xoxb-...) in config.yaml.
+#
+# Socket Mode is enabled below so no public URL is required.
+
+display_information:
+  name: 9Mui
+  description: Personal reminder + sales opportunity bot
+  background_color: "#1f2937"
+
+features:
+  bot_user:
+    display_name: 9Mui
+    always_online: true
+
+  slash_commands:
+    - command: /list
+      description: Show pending reminders
+      usage_hint: ""
+      should_escape: false
+    - command: /opp
+      description: Sales opportunities (try /opp help)
+      usage_hint: "help | new <title> | list | show <id> | update <id> <note>"
+      should_escape: false
+    - command: /invite
+      description: Invite a secretary (owner only, uses Telegram link)
+      usage_hint: ""
+      should_escape: false
+    - command: /members
+      description: List secretaries / show your owner
+      usage_hint: ""
+      should_escape: false
+    - command: /revoke
+      description: Revoke a secretary (owner only)
+      usage_hint: "<chat_id>"
+      should_escape: false
+    - command: /leave
+      description: Step down as a secretary
+      usage_hint: ""
+      should_escape: false
+    - command: /whoami
+      description: Show your role
+      usage_hint: ""
+      should_escape: false
+    - command: /help
+      description: Show help
+      usage_hint: ""
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      - chat:write          # send messages and reminders
+      - commands            # receive slash commands
+      - im:history          # read DMs for free-text thought capture
+      - im:read             # see DM channels
+      - im:write            # open DMs to deliver reminders
+      - users:read          # resolve user info for display names
+      - files:write         # upload CSV exports
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.im          # DMs to the bot → free-text reminder capture
+  interactivity:
+    is_enabled: true        # buttons + modal submissions
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

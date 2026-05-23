@@ -3,8 +3,14 @@
 # Copy this file to config.yaml and fill in values.
 # ─────────────────────────────────────────────
 
-# Which chat platform to use: telegram | discord | whatsapp
-platform: telegram
+# Which platforms to run concurrently. Each name needs its own block below.
+#   platforms: [telegram]            # Telegram only (default)
+#   platforms: [telegram, slack]     # both — reminders fan out to all
+# Legacy single-platform form still works:
+#   platform: telegram
+platforms:
+  - telegram
+  # - slack
 
 # ── Telegram ──────────────────────────────────
 telegram:
@@ -26,6 +32,26 @@ telegram:
 
   # Cap on active (non-revoked) secretaries per owner.
   max_secretaries_per_owner: 5
+
+# ── Slack ─────────────────────────────────────
+# 1. Create an app at https://api.slack.com/apps
+# 2. Enable Socket Mode → grab the app-level token (xapp-...)
+# 3. Install to your workspace → grab the bot token (xoxb-...)
+# 4. Register the slash commands and event subscriptions from
+#    docs/slack-manifest.yaml
+# 5. Find each user's Slack ID (open their profile → ⋮ → Copy member ID)
+#    and add them to user_map below. The VALUE must be the user's
+#    canonical chat_id — i.e. their Telegram chat_id, since v1 reuses
+#    Telegram's numeric identity space.
+#
+# Invites stay Telegram-only in v1. To add a Slack-only secretary,
+# invite them through Telegram first, then add their Slack ID here.
+# slack:
+#   bot_token: "xoxb-YOUR-BOT-TOKEN"
+#   app_token: "xapp-YOUR-APP-TOKEN"
+#   user_map:
+#     U01ABCDEF: "123456789"   # Slack user → canonical (Telegram) chat_id
+#     U02GHIJKL: "987654321"
 
 # ── Discord (future) ──────────────────────────
 # discord:

@@ -12,7 +12,8 @@ from config import load_config
 from database import init_db, get_session, Thought, Reminder
 from scheduler import init_scheduler, schedule_new_reminder, cancel_reminder, get_next_run_time
 from time_parser import parse_message
-from platforms import load_platform
+from platforms import load_all_platforms
+from dispatcher import Dispatcher
 from opp import (
     STAGE_ADVANCE,
     parse_opp_command,
@@ -57,7 +58,10 @@ def _esc(text: str) -> str:
 
 
 cfg = load_config()
-platform = None  # set after init
+# Dispatcher owns the list of active platforms and fans cross-platform
+# sends (reminders, owner notifications) out to every platform that can
+# reach the user. Set in main().
+dispatcher: Dispatcher | None = None
 
 # Tags injected into ForceReply prompts so we can pick the right opp id
 # back out of the user's reply without holding conversation state.
@@ -184,10 +188,14 @@ async def _handle_start_args(chat_id: str, args: str, first_name: str | None) ->
 
 
 async def _notify(chat_id: str, text: str) -> None:
-    """Best-effort send to another chat. Used for owner notifications."""
+    """Best-effort cross-platform send. Used for owner notifications.
+    Each platform that can reach the user gets the message; the
+    dispatcher swallows per-platform errors so one failure can't
+    suppress the others."""
+    if dispatcher is None:
+        return
     try:
-        if platform is not None:
-            await platform.send_html(chat_id, text)
+        await dispatcher.send_html(chat_id, text)
     except Exception as e:
         logger.warning("notify to %s failed: %s", chat_id, e)
 
@@ -685,9 +693,15 @@ async def _handle_opp_force_reply(
 async def send_reminder(chat_id: str, content: str, reminder_id: int):
     """Called by APScheduler when a reminder fires.
 
-    chat_id is the OWNER's chat_id (we store Thought.chat_id as the owner).
-    If the reminder was created by a secretary, we prefix the message
-    with "(via <name>)" so the owner knows who added it.
+    chat_id is the OWNER's canonical chat_id (we store Thought.chat_id as
+    the owner). If the reminder was created by a secretary, we prefix
+    the message with "(via <name>)" so the owner knows who added it.
+
+    Fan-out: the dispatcher delivers to every platform that can reach
+    the user. A user on both Telegram and Slack gets two pings; the
+    buttons on each are independent (clicking Done on Telegram does
+    not edit the Slack copy — the duplicate's click is rejected
+    idempotently).
     """
     via = ""
     with get_session() as session:
@@ -698,21 +712,28 @@ async def send_reminder(chat_id: str, content: str, reminder_id: int):
             if actor:
                 via = f"(via {actor}) "
 
-    await platform.send_reminder(chat_id, f"{via}{content}", reminder_id)
+    if dispatcher is None:
+        logger.warning("send_reminder called before dispatcher init")
+        return
+    await dispatcher.send_reminder(chat_id, f"{via}{content}", reminder_id)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
 
 
 async def main():
-    global platform
+    global dispatcher
 
     db_path = os.environ.get("DB_PATH", "/app/data/reminders.db")
     init_db(db_path)
     init_scheduler(db_path, send_reminder)
 
-    platform = load_platform(cfg, on_message, send_reminder, get_pending_items_owner_only, __version__)
-    await platform.run()
+    platforms = load_all_platforms(
+        cfg, on_message, send_reminder, get_pending_items_owner_only, __version__,
+    )
+    dispatcher = Dispatcher(platforms)
+    logger.info("Starting platforms: %s", [p.name for p in platforms])
+    await dispatcher.run()
 
 
 def get_pending_items_owner_only(chat_id: str) -> list[dict]:
