@@ -3,3 +3,6 @@ APScheduler==3.10.4
 SQLAlchemy==2.0.36
 PyYAML==6.0.2
 dateparser==1.2.0
+slack_bolt==1.21.2
+slack_sdk==3.33.4
+aiohttp==3.10.10

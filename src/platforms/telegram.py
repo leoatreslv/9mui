@@ -59,6 +59,8 @@ def _esc(text: str) -> str:
 
 
 class TelegramPlatform(BasePlatform):
+    name = "telegram"
+
     def __init__(self, cfg, on_message: Callable, send_reminder_fn: Callable,
                  get_pending_items: Callable = None, timezone: str = "UTC",
                  version: str = ""):
@@ -74,6 +76,14 @@ class TelegramPlatform(BasePlatform):
         self._app = None
 
     # ── BasePlatform contract + small extension for owner notifications ──
+
+    def identity_for(self, canonical_chat_id: str) -> str | None:
+        # Canonical chat_id == Telegram chat_id by v1 invariant.
+        # Any numeric string is reachable in principle; bad ids will
+        # error at send time, which Telegram itself logs.
+        if canonical_chat_id is None or not str(canonical_chat_id).lstrip("-").isdigit():
+            return None
+        return str(canonical_chat_id)
 
     async def send_message(self, chat_id: str, text: str) -> None:
         await self._app.bot.send_message(chat_id=chat_id, text=text)
