@@ -11,8 +11,6 @@ import pytest
 
 from database import (
     Invite,
-    Opportunity,
-    OpportunityUpdate,
     Reminder,
     Secretary,
     SecretaryEvent,

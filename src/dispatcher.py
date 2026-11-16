@@ -55,6 +55,18 @@ class Dispatcher:
             except Exception:
                 logger.exception("send_html failed on platform %s", p.name)
 
+    async def wait_ready(self, timeout: float = 60) -> None:
+        """Wait until every platform can send, or `timeout` seconds —
+        whichever comes first. A platform that never comes up must not
+        hold reminders back on the others forever."""
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(p.wait_ready() for p in self._platforms)),
+                timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Not every platform was ready after %ss; continuing.", timeout)
+
     async def run(self) -> None:
         """Run every platform concurrently. A crash on one is logged but
         doesn't tear down the others — gather with return_exceptions

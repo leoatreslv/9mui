@@ -15,7 +15,7 @@
 
 display_information:
   name: 9Mui
-  description: Personal reminder + sales opportunity bot
+  description: Personal reminder bot
   background_color: "#1f2937"
 
 features:
@@ -27,10 +27,6 @@ features:
     - command: /list
       description: Show pending reminders
       usage_hint: ""
-      should_escape: false
-    - command: /opp
-      description: Sales opportunities (try /opp help)
-      usage_hint: "help | new <title> | list | show <id> | update <id> <note>"
       should_escape: false
     - command: /invite
       description: Invite a secretary (owner only, uses Telegram link)
@@ -66,7 +62,6 @@ oauth_config:
       - im:read             # see DM channels
       - im:write            # open DMs to deliver reminders
       - users:read          # resolve user info for display names
-      - files:write         # upload CSV exports
 
 settings:
   event_subscriptions:
