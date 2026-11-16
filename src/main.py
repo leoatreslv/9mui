@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import re
 from datetime import datetime, timedelta
 from html import escape
 
@@ -10,25 +9,16 @@ __version__ = "0.1"
 import pytz
 from config import load_config
 from database import init_db, get_session, Thought, Reminder
-from scheduler import init_scheduler, schedule_new_reminder, cancel_reminder, get_next_run_time
+from scheduler import (
+    init_scheduler,
+    resume_scheduler,
+    schedule_reminder,
+    remove_job,
+    get_next_run_time,
+)
 from time_parser import parse_message
 from platforms import load_all_platforms
 from dispatcher import Dispatcher
-from opp import (
-    STAGE_ADVANCE,
-    parse_opp_command,
-    get_opp,
-    list_opps,
-    create_opp,
-    append_update,
-    change_stage,
-    soft_delete,
-    format_card,
-    format_show,
-    format_markdown_table,
-    build_csv,
-)
-import secretary as sec_mod
 from secretary import (
     InviteError,
     INVITE_TOKEN_PREFIX,
@@ -38,10 +28,8 @@ from secretary import (
     create_invite,
     display_name_for,
     format_actor,
-    is_owner,
     leave_workspace,
     list_secretaries,
-    refresh_display_name,
     resolve_owner,
     revoke_secretary,
 )
@@ -51,6 +39,36 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# /list shows at most this many reminders.
+LIST_LIMIT = 20
+# Upper bound accepted from a snooze button payload.
+MAX_SNOOZE_HOURS = 24 * 7
+
+HELP_TEXT = """\
+<b>9Mui — Personal Reminder Bot</b>
+<i>v{version}</i>
+
+<b>How to use</b>
+Send any thought or task — I'll remind you. Or invite secretaries to add things on your behalf.
+
+<b>Commands</b>
+  /list      — show pending reminders
+  /invite    — invite a secretary (owner only)
+  /members   — list secretaries / show your owner
+  /revoke    — revoke a secretary (owner only)
+  /leave     — step down as a secretary
+  /whoami    — show your role
+  /help      — show this message
+
+<b>Reminder actions</b>
+  ✅ Done · ⏰ Snooze 2h / 8h · 🗑️ Delete
+
+<b>Time expressions</b>
+  • <i>at 4pm</i>, <i>by 3pm</i>, <i>in 2 hours</i>
+  • <i>tomorrow 9am</i>, <i>next Monday</i>
+  • <i>明天下午4點</i>, <i>5分鐘後</i>
+"""
 
 
 def _esc(text: str) -> str:
@@ -63,89 +81,85 @@ cfg = load_config()
 # reach the user. Set in main().
 dispatcher: Dispatcher | None = None
 
-# Tags injected into ForceReply prompts so we can pick the right opp id
-# back out of the user's reply without holding conversation state.
-FORCEREPLY_TAG_RE = re.compile(r"opp\s+#(\d+)")
-
 
 def _allowed_set() -> set[int]:
     return set(cfg.telegram.allowed_chat_ids) if cfg.telegram else set()
 
 
-def _telegram_bot_username() -> str:
-    """Read from config if present; otherwise empty (caller falls back).
-    Used to construct invite deep-links. We don't fetch from the Bot API
-    at call time — that requires an event loop and an instantiated bot.
-    Operators can set this in config for accurate links."""
-    return getattr(cfg.telegram, "bot_username", "") if cfg.telegram else ""
+def _invites_enabled() -> bool:
+    return cfg.telegram.allow_invites if cfg.telegram else True
+
+
+def _local_str(dt: datetime) -> str:
+    """Format a naive-UTC (or aware) datetime in the configured timezone."""
+    if dt.tzinfo is None:
+        dt = pytz.utc.localize(dt)
+    return dt.astimezone(pytz.timezone(cfg.timezone)).strftime("%Y-%m-%d %H:%M")
 
 
 # ── Top-level message router ─────────────────────────────────────────────
 
 
+def _split_command(text: str) -> tuple[str | None, str]:
+    """"/List@my_bot  foo" → ("/list", "foo"); free text → (None, text)."""
+    if not text.startswith("/"):
+        return None, text
+    parts = text.split(None, 1)
+    cmd = parts[0].split("@", 1)[0].lower()
+    return cmd, parts[1].strip() if len(parts) > 1 else ""
+
+
 async def on_message(
     chat_id: str,
     text: str,
-    reply_to_text: str | None = None,
     user_first_name: str | None = None,
 ) -> str | dict:
-    """Central handler.
+    """Central handler, shared by every platform.
 
-    Returns either a string (plain HTML reply) or a dict carrying a
-    structured response (CSV upload, opp cards, ForceReply prompt, etc.).
+    Returns either a string (plain HTML reply; "" means stay silent) or
+    a dict carrying a structured response (currently only
+    {"kind": "reminder_cards", ...}).
     """
-    text = text.strip()
-    allowed = _allowed_set()
+    text = (text or "").strip()
+    cmd, args = _split_command(text)
 
     # /start with an invite payload is the ONE path that bypasses the
     # owner gate — invitees obviously aren't allowed yet.
-    if text.startswith("/start "):
-        return await _handle_start_args(chat_id, text[len("/start "):].strip(), user_first_name)
+    if cmd == "/start" and args:
+        return await _handle_start_args(chat_id, args, user_first_name)
 
-    # Plain /start with no payload from an unknown chat — silent no-op
-    # (matches existing _is_allowed behavior of the bot).
     with get_session() as session:
-        ctx = resolve_owner(session, chat_id, allowed)
+        ctx = resolve_owner(session, chat_id, _allowed_set())
         if ctx is None:
-            return ""
+            return ""  # unknown chat — silent
 
-        # Cache the first_name if it's a secretary so cards render properly.
-        if ctx.is_secretary and user_first_name:
-            refresh_display_name(session, chat_id, user_first_name)
+        # Cache the first_name of a secretary so cards render properly.
+        sec = ctx.secretary
+        if sec is not None and user_first_name and sec.display_name != user_first_name:
+            sec.display_name = user_first_name
             session.commit()
 
-    if text == "/list":
-        return _render_list(chat_id, ctx)
+    if cmd is None:
+        return _handle_thought(ctx, text)
 
-    if text == "/whoami":
-        return _render_whoami(chat_id, ctx)
+    if cmd == "/callback":
+        return _handle_callback(ctx, args)
 
-    if text == "/members":
-        return _render_members(chat_id, ctx)
+    if cmd in ("/start", "/help"):
+        return HELP_TEXT.format(version=__version__)
+    if cmd == "/list":
+        return _render_list(ctx)
+    if cmd in ("/whoami", "/members"):
+        return _render_whoami(ctx)
+    if cmd == "/invite":
+        return _handle_invite(ctx)
+    if cmd == "/revoke":
+        return _handle_revoke(ctx, args)
+    if cmd == "/leave":
+        return await _handle_leave(ctx)
 
-    if text == "/invite":
-        return _handle_invite(chat_id, ctx)
-
-    if text.startswith("/revoke"):
-        return _handle_revoke(chat_id, ctx, text[len("/revoke"):].strip())
-
-    if text == "/leave":
-        return _handle_leave(chat_id, ctx)
-
-    if text.startswith("/callback "):
-        return await _cmd_callback(chat_id, ctx, text[len("/callback "):])
-
-    if text.startswith("/opp"):
-        return await _handle_opp(chat_id, ctx, text)
-
-    # ForceReply pickup for opp updates
-    if reply_to_text:
-        m = FORCEREPLY_TAG_RE.search(reply_to_text)
-        if m:
-            return await _handle_opp_force_reply(chat_id, ctx, int(m.group(1)), text)
-
-    # Free-text thought capture
-    return _handle_thought(chat_id, ctx, text)
+    # Never store an unrecognised command as a reminder.
+    return "❓ Unknown command. Try /help."
 
 
 # ── /start <invite_token> ────────────────────────────────────────────────
@@ -155,7 +169,7 @@ async def _handle_start_args(chat_id: str, args: str, first_name: str | None) ->
     if not args.startswith(INVITE_TOKEN_PREFIX):
         return ""  # silent
 
-    if cfg.telegram and getattr(cfg.telegram, "allow_invites", True) is False:
+    if not _invites_enabled():
         return "❌ Invites are disabled on this bot."
 
     with get_session() as session:
@@ -172,26 +186,24 @@ async def _handle_start_args(chat_id: str, args: str, first_name: str | None) ->
         except InviteError as e:
             return f"❌ {_esc(str(e))}"
 
-    # Notify the owner — fire-and-forget, no need to await on the reply.
-    owner_msg = (
+    await _notify(
+        owner_chat_id,
         f"✅ <b>{_esc(first_name or 'Someone')} (…{chat_id[-4:]})</b> "
         f"accepted your invite.\n\n"
-        f"If this isn't who you meant, run <code>/revoke {chat_id}</code> right away."
+        f"If this isn't who you meant, run <code>/revoke {chat_id}</code> right away.",
     )
-    asyncio.create_task(_notify(owner_chat_id, owner_msg))
 
     return (
         "👋 Welcome! You're now a secretary.\n\n"
-        "Anything you type becomes a reminder for your owner. Use /opp commands "
-        "to manage their sales pipeline. /whoami to see who you're helping."
+        "Anything you type becomes a reminder for your owner. "
+        "/whoami to see who you're helping."
     )
 
 
 async def _notify(chat_id: str, text: str) -> None:
     """Best-effort cross-platform send. Used for owner notifications.
-    Each platform that can reach the user gets the message; the
-    dispatcher swallows per-platform errors so one failure can't
-    suppress the others."""
+    Each platform that can reach the user gets the message; failures are
+    logged and never propagate to the caller."""
     if dispatcher is None:
         return
     try:
@@ -203,50 +215,42 @@ async def _notify(chat_id: str, text: str) -> None:
 # ── /whoami /members /invite /revoke /leave ──────────────────────────────
 
 
-def _render_whoami(chat_id: str, ctx: OwnerContext) -> str:
-    if ctx.is_secretary:
-        owner_name = _display_or_id(ctx.owner_chat_id)
-        return (
-            f"👤 You're a <b>secretary</b> for {owner_name}.\n"
-            "Anything you add goes on their list; /leave to step down."
-        )
+def _render_whoami(ctx: OwnerContext) -> str:
+    """Also serves /members — same content for now."""
     with get_session() as session:
+        if ctx.is_secretary:
+            owner_name = _owner_label(session, ctx.owner_chat_id)
+            return (
+                f"👤 You're a <b>secretary</b> for {owner_name}.\n"
+                "Anything you add goes on their list; /leave to step down."
+            )
         secs = list_secretaries(session, ctx.owner_chat_id)
-    if not secs:
-        return "👤 You're the <b>owner</b>. No secretaries yet — use /invite to add one."
-    lines = [f"👤 You're the <b>owner</b>. Active secretaries ({len(secs)}):"]
-    for s in secs:
-        lines.append(f"  • {_esc(s.display_name or '—')} · <code>{s.secretary_chat_id}</code>")
-    return "\n".join(lines)
+        if not secs:
+            return "👤 You're the <b>owner</b>. No secretaries yet — use /invite to add one."
+        lines = [f"👤 You're the <b>owner</b>. Active secretaries ({len(secs)}):"]
+        for s in secs:
+            lines.append(f"  • {_esc(s.display_name or '—')} · <code>{s.secretary_chat_id}</code>")
+        return "\n".join(lines)
 
 
-def _render_members(chat_id: str, ctx: OwnerContext) -> str:
-    # Same content as whoami for now — kept as a separate command because
-    # users expect /members to exist when they hear "shared bot".
-    return _render_whoami(chat_id, ctx)
-
-
-def _display_or_id(chat_id: str) -> str:
-    """Returns a renderable label for a chat_id — display name if known,
-    else the bare numeric id."""
-    with get_session() as session:
-        name = display_name_for(session, chat_id)
+def _owner_label(session, chat_id: str) -> str:
+    """Renderable label for a chat_id — display name if known, else the
+    bare numeric id."""
+    name = display_name_for(session, chat_id)
     return f"{_esc(name)} (<code>{chat_id}</code>)" if name else f"<code>{chat_id}</code>"
 
 
-def _handle_invite(chat_id: str, ctx: OwnerContext) -> str:
+def _handle_invite(ctx: OwnerContext) -> str:
     if ctx.is_secretary:
         return "❌ Only the owner can invite secretaries."
 
-    if cfg.telegram and getattr(cfg.telegram, "allow_invites", True) is False:
+    if not _invites_enabled():
         return "❌ Invites are disabled on this bot."
 
     if not _allowed_set():
         return "❌ This bot has no configured owner. Add yourself to allowed_chat_ids first."
 
-    max_sec = (
-        getattr(cfg.telegram, "max_secretaries_per_owner", 5) if cfg.telegram else 5
-    )
+    max_sec = cfg.telegram.max_secretaries_per_owner if cfg.telegram else 5
 
     with get_session() as session:
         try:
@@ -257,24 +261,23 @@ def _handle_invite(chat_id: str, ctx: OwnerContext) -> str:
         except InviteError as e:
             return f"❌ {_esc(str(e))}"
 
-    bot_username = _telegram_bot_username()
+    bot_username = cfg.telegram.bot_username if cfg.telegram else ""
     if bot_username:
         link = f"https://t.me/{bot_username}?start={token}"
         link_html = f'<a href="{_esc(link)}">{_esc(link)}</a>'
     else:
         link_html = f"<code>?start={_esc(token)}</code> (set telegram.bot_username in config for a full link)"
 
-    expires_local = pytz.utc.localize(expires).astimezone(pytz.timezone(cfg.timezone))
     return (
         "🔗 <b>Invite link:</b>\n"
         f"{link_html}\n\n"
-        f"⏰ Valid until <b>{expires_local.strftime('%Y-%m-%d %H:%M')}</b> · single-use.\n\n"
+        f"⏰ Valid until <b>{_local_str(expires)}</b> · single-use.\n\n"
         "⚠️ Anyone who opens this link within 24h becomes your secretary. "
         "Do not forward, post publicly, or screenshot to channels."
     )
 
 
-def _handle_revoke(chat_id: str, ctx: OwnerContext, args: str) -> str:
+def _handle_revoke(ctx: OwnerContext, args: str) -> str:
     if ctx.is_secretary:
         return "❌ Only the owner can revoke secretaries."
     target = args.strip()
@@ -284,19 +287,32 @@ def _handle_revoke(chat_id: str, ctx: OwnerContext, args: str) -> str:
     with get_session() as session:
         try:
             sec = revoke_secretary(session, ctx.owner_chat_id, target)
-            name = sec.display_name or target
-            # Cancel any pending reminders this secretary created.
-            cancelled = _cancel_secretary_pending_reminders(session, ctx.owner_chat_id, target)
-            session.commit()
         except InviteError as e:
             return f"❌ {_esc(str(e))}"
+        name = sec.display_name or target
+        cancelled_ids = _cancel_secretary_pending_reminders(session, ctx.owner_chat_id, target)
+        session.commit()
 
-    tail = f" Cancelled {cancelled} pending reminder(s) they had created." if cancelled else ""
+    # Job store has its own connection — touch it only after our commit.
+    for reminder_id in cancelled_ids:
+        remove_job(reminder_id)
+
+    tail = (
+        f" Cancelled {len(cancelled_ids)} pending reminder(s) they had created."
+        if cancelled_ids else ""
+    )
     return f"🗑️ Revoked secretary <b>{_esc(name)}</b>.{tail}"
 
 
-def _cancel_secretary_pending_reminders(session, owner_chat_id: str, secretary_chat_id: str) -> int:
-    """Cancel APScheduler jobs + delete pending reminders the secretary had set."""
+def _cancel_secretary_pending_reminders(
+    session, owner_chat_id: str, secretary_chat_id: str
+) -> list[int]:
+    """Cancel (not delete) the still-active reminders a secretary set.
+
+    The thought rows stay, marked "cancelled", so the owner's history is
+    preserved. Returns the reminder ids whose jobs the caller must remove
+    after committing.
+    """
     rows = (
         session.query(Thought, Reminder)
         .join(Reminder, Reminder.thought_id == Thought.id)
@@ -304,19 +320,19 @@ def _cancel_secretary_pending_reminders(session, owner_chat_id: str, secretary_c
             Thought.chat_id == owner_chat_id,
             Thought.created_by_chat_id == secretary_chat_id,
             Thought.status == "pending",
-            Reminder.is_active == True,
+            Reminder.is_active.is_(True),
         )
         .all()
     )
-    count = 0
+    ids = []
     for thought, reminder in rows:
-        cancel_reminder(reminder.id)
-        session.delete(thought)
-        count += 1
-    return count
+        thought.status = "cancelled"
+        reminder.is_active = False
+        ids.append(reminder.id)
+    return ids
 
 
-def _handle_leave(chat_id: str, ctx: OwnerContext) -> str:
+async def _handle_leave(ctx: OwnerContext) -> str:
     if not ctx.is_secretary:
         return "❌ You're the owner — there's nothing to leave."
     with get_session() as session:
@@ -328,46 +344,34 @@ def _handle_leave(chat_id: str, ctx: OwnerContext) -> str:
         except InviteError as e:
             return f"❌ {_esc(str(e))}"
 
-    asyncio.create_task(_notify(
-        owner_chat_id, f"👋 <b>{_esc(name)}</b> has left as your secretary."
-    ))
+    await _notify(owner_chat_id, f"👋 <b>{_esc(name)}</b> has left as your secretary.")
     return "👋 You've stepped down. You can no longer add to that owner's list."
 
 
 # ── /list ────────────────────────────────────────────────────────────────
 
 
-def _render_list(chat_id: str, ctx: OwnerContext) -> str | dict:
+def _render_list(ctx: OwnerContext) -> str | dict:
     items = get_pending_items(ctx)
     if not items:
         return "📭 No pending reminders."
+    header = f"📋 <b>{len(items)} pending reminder(s):</b>"
+    if len(items) == LIST_LIMIT:
+        header = f"📋 <b>Latest {LIST_LIMIT} pending reminders:</b>"
     return {
         "kind": "reminder_cards",
-        "header": f"📋 <b>{len(items)} pending reminder(s):</b>",
+        "header": header,
         "items": [
-            {
-                "reminder_id": it["reminder_id"],
-                "text": _format_reminder_card_text(it, ctx),
-                "creator_chat_id": it["created_by_chat_id"],
-            }
+            {"reminder_id": it["reminder_id"], "text": _format_reminder_card_text(it)}
             for it in items
         ],
     }
 
 
-def _format_reminder_card_text(it: dict, ctx: OwnerContext) -> str:
-    if it["next_run"]:
-        nr = it["next_run"]
-        if nr.tzinfo is None:
-            nr = pytz.utc.localize(nr)
-        next_str = nr.astimezone(pytz.timezone(cfg.timezone)).strftime("%Y-%m-%d %H:%M")
-    else:
-        next_str = "—"
+def _format_reminder_card_text(it: dict) -> str:
+    next_str = _local_str(it["next_run"]) if it["next_run"] else "—"
     recur = f"every {it['repeat_hours']}h" if it["repeat_hours"] else "once"
-
-    with get_session() as session:
-        actor = format_actor(session, it["created_by_chat_id"], ctx.owner_chat_id)
-    actor_tag = f" · by {_esc(actor)}" if actor else ""
+    actor_tag = f" · by {_esc(it['actor'])}" if it["actor"] else ""
     return (
         f"📝 {_esc(it['content'])}\n"
         f"<i>{_esc(recur)} · next: {next_str}{actor_tag}</i>"
@@ -375,7 +379,7 @@ def _format_reminder_card_text(it: dict, ctx: OwnerContext) -> str:
 
 
 def get_pending_items(ctx: OwnerContext) -> list[dict]:
-    """All pending reminders the actor is allowed to see.
+    """Pending reminders the actor is allowed to see, newest first.
 
     Owner: everything on their list. Secretary: only what they themselves
     created. The filter is applied at the DB layer so secretaries can never
@@ -388,24 +392,29 @@ def get_pending_items(ctx: OwnerContext) -> list[dict]:
             .filter(
                 Thought.chat_id == ctx.owner_chat_id,
                 Thought.status == "pending",
-                Reminder.is_active == True,
+                Reminder.is_active.is_(True),
             )
         )
         if ctx.is_secretary:
             q = q.filter(Thought.created_by_chat_id == ctx.actor_chat_id)
 
-        rows = q.order_by(Thought.created_at.desc()).limit(20).all()
+        rows = q.order_by(Thought.created_at.desc()).limit(LIST_LIMIT).all()
 
+        # One lookup per distinct creator rather than one per row.
+        actors: dict[str | None, str] = {}
         items = []
         for thought, reminder in rows:
-            next_run = get_next_run_time(reminder.id)
+            creator = thought.created_by_chat_id
+            if creator not in actors:
+                actors[creator] = format_actor(session, creator, ctx.owner_chat_id)
             items.append({
                 "thought_id": thought.id,
                 "reminder_id": reminder.id,
                 "content": thought.content,
                 "repeat_hours": reminder.repeat_hours,
-                "next_run": next_run,
-                "created_by_chat_id": thought.created_by_chat_id,
+                "next_run": get_next_run_time(reminder.id),
+                "created_by_chat_id": creator,
+                "actor": actors[creator],
             })
         return items
 
@@ -413,8 +422,12 @@ def get_pending_items(ctx: OwnerContext) -> list[dict]:
 # ── Free-text thought capture ────────────────────────────────────────────
 
 
-def _handle_thought(chat_id: str, ctx: OwnerContext, text: str) -> str:
+def _handle_thought(ctx: OwnerContext, text: str) -> str:
+    if not text:
+        return ""
+
     content, remind_at = parse_message(text, cfg.timezone)
+    content = content or text
 
     with get_session() as session:
         thought = Thought(
@@ -422,53 +435,48 @@ def _handle_thought(chat_id: str, ctx: OwnerContext, text: str) -> str:
             created_by_chat_id=ctx.actor_chat_id,
             content=content,
         )
-        session.add(thought)
-        session.flush()
-
         if remind_at:
-            reminder = Reminder(thought_id=thought.id, remind_at=remind_at, repeat_hours=0)
-            tz = pytz.timezone(cfg.timezone)
-            local_time = pytz.utc.localize(remind_at).astimezone(tz).strftime('%Y-%m-%d %H:%M')
-            base = f"✅ Got it! Reminder at <b>{local_time}</b>."
+            reminder = Reminder(remind_at=remind_at, repeat_hours=0)
+            base = f"✅ Got it! Reminder at <b>{_local_str(remind_at)}</b>."
         else:
             interval = cfg.reminder.default_interval_hours
-            reminder = Reminder(thought_id=thought.id, repeat_hours=interval)
+            reminder = Reminder(repeat_hours=interval)
             base = f"✅ Got it! Repeats every <b>{interval} hours</b>."
-
-        session.add(reminder)
+        thought.reminders.append(reminder)
+        session.add(thought)
         session.commit()
-        schedule_new_reminder(reminder.id, ctx.owner_chat_id, remind_at, reminder.repeat_hours)
 
-        if ctx.is_secretary:
-            owner_label = _display_or_id(ctx.owner_chat_id)
-            return f"✅ Added to {owner_label}'s reminders.\n{base}"
+        reminder_id, repeat_hours = reminder.id, reminder.repeat_hours
+        owner_label = _owner_label(session, ctx.owner_chat_id) if ctx.is_secretary else None
 
+    schedule_reminder(reminder_id, ctx.owner_chat_id, remind_at, repeat_hours)
+
+    if owner_label:
+        return f"✅ Added to {owner_label}'s reminders.\n{base}"
     return base
 
 
-# ── Callback handler ─────────────────────────────────────────────────────
+# ── Callback handler (inline buttons) ────────────────────────────────────
 
 
-async def _cmd_callback(chat_id: str, ctx: OwnerContext, data: str) -> str | dict:
-    parts = data.split(":")
-
-    if parts[0] in ("done", "delete", "snooze"):
-        return await _handle_reminder_callback(chat_id, ctx, parts)
-
-    if parts[0].startswith("opp_"):
-        return await _handle_opp_callback(chat_id, ctx, parts)
-
-    return "❓ Unknown action."
-
-
-async def _handle_reminder_callback(chat_id: str, ctx: OwnerContext, parts: list[str]) -> str:
+def _handle_callback(ctx: OwnerContext, data: str) -> str:
     """done:N, delete:N, snooze:H:N — all gated by creator-or-owner."""
-    if parts[0] == "snooze":
-        hours = int(parts[1])
-        reminder_id = int(parts[2])
-    else:
-        hours = None
-        reminder_id = int(parts[1])
+    parts = data.split(":")
+    action = parts[0]
+    try:
+        if action in ("done", "delete") and len(parts) == 2:
+            hours, reminder_id = None, int(parts[1])
+        elif action == "snooze" and len(parts) == 3:
+            hours, reminder_id = int(parts[1]), int(parts[2])
+            if not 0 < hours <= MAX_SNOOZE_HOURS:
+                raise ValueError(hours)
+        else:
+            return "❓ Unknown action."
+    except ValueError:
+        return "❓ Unknown action."
+
+    stale_jobs: list[int] = []   # jobs to drop once our transaction is committed
+    snooze = None                # (remind_at, repeat_hours, first_run)
 
     with get_session() as session:
         reminder = session.get(Reminder, reminder_id)
@@ -480,211 +488,45 @@ async def _handle_reminder_callback(chat_id: str, ctx: OwnerContext, parts: list
         if not can_act_on_reminder(ctx, thought.created_by_chat_id):
             return "❌ You can only act on reminders you created."
 
-    if parts[0] == "done":
-        cancel_reminder(reminder_id)
-        with get_session() as session:
-            r = session.get(Reminder, reminder_id)
-            if r:
-                r.thought.status = "done"
-                session.commit()
-        return "✅ Marked as done!"
+        if action == "delete":
+            stale_jobs = [r.id for r in thought.reminders]
+            session.delete(thought)
+            reply = "🗑️ Deleted."
 
-    if parts[0] == "delete":
-        cancel_reminder(reminder_id)
-        with get_session() as session:
-            r = session.get(Reminder, reminder_id)
-            if r:
-                session.delete(r.thought)
-                session.commit()
-        return "🗑️ Deleted."
+        elif action == "done":
+            thought.status = "done"
+            for r in thought.reminders:
+                r.is_active = False
+                stale_jobs.append(r.id)
+            reply = "✅ Marked as done!"
 
-    if parts[0] == "snooze":
-        snooze_until = datetime.utcnow() + timedelta(hours=hours)
-        cancel_reminder(reminder_id)
-        with get_session() as session:
-            old = session.get(Reminder, reminder_id)
-            if old is None:
-                return "❌ Reminder not found."
-            new_reminder = Reminder(
-                thought_id=old.thought_id,
-                remind_at=snooze_until,
-                repeat_hours=0,
-            )
-            session.add(new_reminder)
-            session.commit()
-            schedule_new_reminder(new_reminder.id, ctx.owner_chat_id, snooze_until, 0)
-        return f"⏰ Snoozed for {hours}h."
+        else:  # snooze
+            if thought.status != "pending":
+                # e.g. a stale button on another platform's copy of the card.
+                return "❌ This reminder is already closed."
+            until = datetime.utcnow() + timedelta(hours=hours)
+            # Older releases created a fresh row per snooze; make sure only
+            # the row being snoozed stays live so the user isn't pinged twice.
+            for r in thought.reminders:
+                if r.id != reminder.id and r.is_active:
+                    r.is_active = False
+                    stale_jobs.append(r.id)
+            reminder.is_active = True
+            if not reminder.repeat_hours:
+                reminder.remind_at = until
+            # A recurring reminder keeps its interval; only the next fire moves.
+            snooze = (reminder.remind_at, reminder.repeat_hours or 0, until)
+            reply = f"⏰ Snoozed for {hours}h."
 
-    return "❓ Unknown reminder action."
-
-
-async def _handle_opp_callback(chat_id: str, ctx: OwnerContext, parts: list[str]) -> str | dict:
-    action = parts[0]
-    opp_id = int(parts[1])
-
-    if action == "opp_advance":
-        with get_session() as session:
-            opp = get_opp(session, ctx.owner_chat_id, opp_id)
-            if not opp:
-                return "❌ Opportunity not found (or already deleted)."
-            nxt = STAGE_ADVANCE.get(opp.stage)
-            if nxt is None:
-                return f"⚡ <b>#{opp_id}</b> is already <b>{opp.stage}</b> — no further advance."
-            if opp.stage == nxt:   # idempotent guard against double-tap
-                return f"⚡ <b>#{opp_id}</b> already at <b>{nxt}</b>."
-            change_stage(session, opp, nxt, by_chat_id=ctx.actor_chat_id)
-            session.commit()
-            return f"▶ <b>#{opp_id}</b> advanced to <b>{nxt}</b>."
-
-    if action == "opp_delete":
-        with get_session() as session:
-            opp = get_opp(session, ctx.owner_chat_id, opp_id)
-            if not opp:
-                return "❌ Already deleted."
-            soft_delete(session, opp)
-            session.commit()
-            return f"🗑️ Opportunity <b>#{opp_id}</b> deleted."
-
-    if action == "opp_update":
-        with get_session() as session:
-            opp = get_opp(session, ctx.owner_chat_id, opp_id)
-            if not opp:
-                return "❌ Opportunity not found."
-            title = opp.title
-        return {
-            "kind": "force_reply",
-            "text": f"📝 Reply to this message with the update note for opp #{opp_id} ({_esc(title)}):",
-        }
-
-    return "❓ Unknown opp action."
-
-
-# ── Opportunities ────────────────────────────────────────────────────────
-
-
-_OPP_HELP = """\
-<b>Sales opportunities</b>
-
-  /opp new <i>&lt;title&gt;</i> [--customer=<i>&lt;name&gt;</i>]
-  /opp update <i>&lt;id&gt;</i> <i>&lt;note&gt;</i>
-  /opp stage <i>&lt;id&gt;</i> <i>&lt;lead|qualified|proposal|won|lost&gt;</i>
-  /opp show <i>&lt;id&gt;</i>
-  /opp list [<i>md</i>] [<i>stage</i>]
-  /opp export csv
-  /opp delete <i>&lt;id&gt;</i>
-"""
-
-
-async def _handle_opp(chat_id: str, ctx: OwnerContext, text: str) -> str | dict:
-    action = parse_opp_command(text)
-
-    if action.kind == "help":
-        return _OPP_HELP
-
-    if action.kind == "invalid":
-        return f"❌ {_esc(action.error or 'Bad command. Try /opp help.')}"
-
-    if action.kind == "new":
-        with get_session() as session:
-            opp = create_opp(session, ctx.owner_chat_id, action.title, action.customer)
-            # Record the actor on the implicit "created" update? No — there's
-            # no update row for creation in the existing model. We rely on
-            # Opportunity.created_at to indicate provenance and tag actor
-            # only when they later add notes / change stage.
-            session.commit()
-            return (
-                f"✅ Opportunity <b>#{opp.id}</b> created.\n\n"
-                + format_card(opp, cfg.timezone)
-            )
-
-    if action.kind == "update":
-        with get_session() as session:
-            opp = get_opp(session, ctx.owner_chat_id, action.opp_id)
-            if not opp:
-                return f"❌ Opportunity #{action.opp_id} not found."
-            append_update(session, opp, action.note, by_chat_id=ctx.actor_chat_id)
-            session.commit()
-            return f"📝 Update added to <b>#{opp.id}</b>."
-
-    if action.kind == "stage":
-        with get_session() as session:
-            opp = get_opp(session, ctx.owner_chat_id, action.opp_id)
-            if not opp:
-                return f"❌ Opportunity #{action.opp_id} not found."
-            if opp.stage == action.stage:
-                return f"⚡ <b>#{opp.id}</b> already at <b>{action.stage}</b>."
-            change_stage(session, opp, action.stage, by_chat_id=ctx.actor_chat_id)
-            session.commit()
-            return f"⚡ <b>#{opp.id}</b> stage → <b>{action.stage}</b>."
-
-    if action.kind == "show":
-        with get_session() as session:
-            opp = get_opp(session, ctx.owner_chat_id, action.opp_id)
-            if not opp:
-                return f"❌ Opportunity #{action.opp_id} not found."
-            return format_show(opp, cfg.timezone)
-
-    if action.kind == "delete":
-        with get_session() as session:
-            opp = get_opp(session, ctx.owner_chat_id, action.opp_id)
-            if not opp:
-                return f"❌ Opportunity #{action.opp_id} not found."
-            soft_delete(session, opp)
-            session.commit()
-            return f"🗑️ Opportunity <b>#{opp.id}</b> deleted."
-
-    if action.kind == "list":
-        with get_session() as session:
-            opps = list_opps(session, ctx.owner_chat_id, action.filter_stage)
-            if not opps:
-                tail = f" with stage <b>{action.filter_stage}</b>" if action.filter_stage else ""
-                return f"📭 No opportunities{tail}."
-
-            if action.list_format == "md":
-                md = format_markdown_table(opps, cfg.timezone)
-                return f"<pre>{_esc(md)}</pre>"
-
-            return {
-                "kind": "opp_cards",
-                "header": f"📊 <b>{len(opps)} opportunit{'y' if len(opps)==1 else 'ies'}</b>"
-                          + (f" · stage <b>{action.filter_stage}</b>" if action.filter_stage else ""),
-                "items": [
-                    {
-                        "opp_id": o.id,
-                        "text": format_card(o, cfg.timezone),
-                        "can_advance": o.stage in STAGE_ADVANCE,
-                    }
-                    for o in opps
-                ],
-            }
-
-    if action.kind == "export":
-        with get_session() as session:
-            opps = list_opps(session, ctx.owner_chat_id)
-            data = build_csv(opps, cfg.timezone)
-            return {
-                "kind": "csv",
-                "filename": f"opportunities-{datetime.utcnow().strftime('%Y%m%d')}.csv",
-                "data": data,
-                "caption": f"📎 Exported {len(opps)} opportunit{'y' if len(opps)==1 else 'ies'}.",
-            }
-
-    return "❓ Unhandled action."
-
-
-async def _handle_opp_force_reply(
-    chat_id: str,
-    ctx: OwnerContext,
-    opp_id: int,
-    note: str,
-) -> str:
-    with get_session() as session:
-        opp = get_opp(session, ctx.owner_chat_id, opp_id)
-        if not opp:
-            return f"❌ Opportunity #{opp_id} not found."
-        append_update(session, opp, note, by_chat_id=ctx.actor_chat_id)
         session.commit()
-        return f"📝 Update added to <b>#{opp_id}</b>."
+
+    for rid in stale_jobs:
+        remove_job(rid)
+    if snooze:
+        remind_at, repeat_hours, first_run = snooze
+        schedule_reminder(reminder_id, ctx.owner_chat_id, remind_at, repeat_hours,
+                          first_run=first_run)
+    return reply
 
 
 # ── Scheduler fan-out ────────────────────────────────────────────────────
@@ -700,9 +542,12 @@ async def send_reminder(chat_id: str, content: str, reminder_id: int):
     Fan-out: the dispatcher delivers to every platform that can reach
     the user. A user on both Telegram and Slack gets two pings; the
     buttons on each are independent (clicking Done on Telegram does
-    not edit the Slack copy — the duplicate's click is rejected
-    idempotently).
+    not edit the Slack copy).
     """
+    if dispatcher is None:
+        logger.warning("send_reminder called before dispatcher init")
+        return
+
     via = ""
     with get_session() as session:
         r = session.get(Reminder, reminder_id)
@@ -712,9 +557,6 @@ async def send_reminder(chat_id: str, content: str, reminder_id: int):
             if actor:
                 via = f"(via {actor}) "
 
-    if dispatcher is None:
-        logger.warning("send_reminder called before dispatcher init")
-        return
     await dispatcher.send_reminder(chat_id, f"{via}{content}", reminder_id)
 
 
@@ -726,21 +568,20 @@ async def main():
 
     db_path = os.environ.get("DB_PATH", "/app/data/reminders.db")
     init_db(db_path)
-    init_scheduler(db_path, send_reminder)
 
-    platforms = load_all_platforms(
-        cfg, on_message, send_reminder, get_pending_items_owner_only, __version__,
-    )
+    # The scheduler accepts jobs from the start (platforms begin taking
+    # messages as soon as each one is up) but fires nothing until every
+    # platform can send, so a reminder that came due while the bot was
+    # down has somewhere to go.
+    init_scheduler(db_path, send_reminder, paused=True)
+
+    platforms = load_all_platforms(cfg, on_message)
     dispatcher = Dispatcher(platforms)
     logger.info("Starting platforms: %s", [p.name for p in platforms])
-    await dispatcher.run()
-
-
-def get_pending_items_owner_only(chat_id: str) -> list[dict]:
-    """Compatibility shim for callers that pass raw chat_id (the platform
-    layer). Wraps in the owner-only context."""
-    ctx = OwnerContext(owner_chat_id=chat_id, actor_chat_id=chat_id, is_secretary=False)
-    return get_pending_items(ctx)
+    runner = asyncio.create_task(dispatcher.run())
+    await dispatcher.wait_ready()
+    resume_scheduler()
+    await runner
 
 
 if __name__ == "__main__":

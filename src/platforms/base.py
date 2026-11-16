@@ -41,6 +41,12 @@ class BasePlatform(ABC):
     ) -> None:
         """Deliver a fired reminder, with Done/Snooze action buttons."""
 
+    async def wait_ready(self) -> None:
+        """Return once the platform can send. The scheduler is started
+        only after every platform is ready, so reminders that came due
+        while the bot was down aren't fired into a half-built client.
+        Default: ready immediately."""
+
     @abstractmethod
     async def run(self) -> None:
         """Start the platform listener. Awaits forever (or until cancelled)."""

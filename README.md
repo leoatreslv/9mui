@@ -79,7 +79,6 @@ Just send a message to your bot:
 | Command | Action |
 |---|---|
 | `/list` | Show pending reminders |
-| `/opp` | Sales-opportunity tracker (see section below) |
 | `/invite` | Invite a secretary to help on your behalf (owner only) |
 | `/members` | Show your secretaries (owner) or your owner (secretary) |
 | `/revoke <chat_id>` | Revoke a secretary (owner only) |
@@ -96,7 +95,7 @@ Just send a message to your bot:
 ## Secretaries
 
 You can invite other Telegram users to act as your secretaries — they
-help by adding reminders and managing your sales pipeline. Everything
+help by adding reminders on your behalf. Everything
 they do lands on **your** list; reminder pings go to **you**.
 
 ### Inviting
@@ -120,15 +119,12 @@ forward it or post it publicly.
 | Send a free-text reminder ("Buy milk 4pm") | ✅ lands on owner's list, pings owner | ✅ |
 | `/list` | only reminders they themselves added | full list |
 | Mark done / snooze / delete a reminder | only on their own additions | any |
-| All `/opp` commands (new, update, stage, delete, export, list) | ✅ full assistant access | ✅ |
-| `/opp list` | sees owner's full pipeline | ✅ |
 | `/invite`, `/revoke` | ❌ | ✅ |
 | `/leave` | ✅ steps down | n/a |
 | `/whoami` | ✅ shows their owner | ✅ shows secretaries |
 
 Reminder cards delivered to the owner are prefixed `(via Alice)` so you
-always know who added what. Opportunity updates show the same
-attribution in `/opp show`, `/opp list md`, and the CSV export.
+always know who added what; `/list` shows the same attribution.
 
 ### Revoking
 
@@ -137,57 +133,14 @@ attribution in `/opp show`, `/opp list md`, and the CSV export.
 ```
 
 Revocation is a soft-delete: the secretary loses access immediately and
-any pending reminders they created (that haven't fired yet) are
-cancelled. Their past contributions remain in your data and continue to
-show "by Alice (former)".
+any still-active reminders they created are cancelled (the rows are
+kept in the database with status `cancelled`, but stop firing and drop
+out of `/list`).
 
 ### Disabling invites
 
 Set `telegram.allow_invites: false` in `config.yaml` and restart. The
 `/invite` command will refuse for everyone.
-
-## Sales Opportunities
-
-Track deals in progress alongside your reminders. Each opportunity has
-a title, customer, stage (`lead → qualified → proposal → won | lost`),
-and an append-only update log.
-
-| Command | Action |
-|---|---|
-| `/opp new <title> [--customer=<name>]` | Create a new opportunity |
-| `/opp update <id> <note>` | Append a timestamped update |
-| `/opp stage <id> <stage>` | Change stage (also logs an audit entry) |
-| `/opp show <id>` | Show one opportunity with full update history |
-| `/opp list [md] [stage]` | List opportunities (cards by default; `md` = markdown table; optional stage filter) |
-| `/opp export csv` | Send a UTF-8-with-BOM CSV file as a Telegram attachment (Excel-friendly) |
-| `/opp delete <id>` | Soft-delete (row stays in DB, filtered out of list) |
-| `/opp help` | Show this list inside Telegram |
-
-**Examples:**
-
-```
-/opp new Acme Q1 renewal --customer=Acme Corp
-/opp update 1 Met with Bob, looking good
-/opp stage 1 proposal
-/opp list
-/opp list won
-/opp list md
-/opp export csv
-```
-
-**Inline buttons on each card:**
-
-- **📝 Update** — bot prompts (ForceReply); your next reply becomes the update note
-- **▶ Advance** — move to the next stage (`lead → qualified → proposal → won`)
-- **🗑️ Delete** — soft-delete
-
-Stages are validated; `/opp stage 5 wun` is rejected. Stage changes
-also write a real update row (`stage: proposal → won`) so the history
-in `/opp show` and the CSV export is complete.
-
-Opportunities are scoped to your Telegram chat ID — if the bot has
-multiple `allowed_chat_ids`, users cannot see or modify each other's
-opportunities.
 
 ## Slack
 
@@ -226,16 +179,14 @@ into Slack via the `user_map`.
 | Feature | Slack |
 |---|---|
 | Free-text reminder capture (DM the bot) | ✅ |
-| All slash commands (`/list`, `/opp`, `/whoami`, `/members`, `/revoke`, `/leave`, `/help`) | ✅ |
-| Inline buttons (Done / Snooze / Delete / Advance) | ✅ Block Kit buttons |
-| `/opp` update prompt | ✅ opens a modal (Slack's analogue of Telegram's ForceReply) |
-| CSV export | ✅ uploaded as a file |
+| All slash commands (`/list`, `/whoami`, `/members`, `/revoke`, `/leave`, `/help`) | ✅ |
+| Inline buttons (Done / Snooze / Delete) | ✅ Block Kit buttons |
 | Owner notifications (invite accepted, secretary left) | ✅ DM to owner on every platform they're on |
 | `/invite` | Generates a Telegram deep-link only (v1 — invites stay Telegram-native) |
 
 ### Known v1 limitations
 
-- **Stale buttons across platforms.** If you're on Telegram + Slack, a reminder fires on both. Clicking ✅ Done on one does *not* edit the duplicate card on the other; the second click is rejected idempotently ("Reminder not found"). Fixing this requires tracking `(platform, channel, ts)` per send — punted to v2.
+- **Stale buttons across platforms.** If you're on Telegram + Slack, a reminder fires on both. Clicking ✅ Done on one does *not* edit the duplicate card on the other; a later Snooze on the stale copy is rejected ("already closed"). Fixing this requires tracking `(platform, channel, ts)` per send — punted to v2.
 - **Slack-only owners are not supported.** Canonical chat_ids must be Telegram-numeric. To add a Slack-only secretary, invite them through Telegram first (they don't need to *use* Telegram afterwards), then map them in `user_map`.
 - **Slack rate limits.** A burst of reminders to the same user is bounded by Slack's ~1 msg/sec per channel; the bot retries on 429 once per send. Sustained fan-out at scale is out of scope.
 
@@ -246,27 +197,34 @@ pip install -r requirements-dev.txt
 PYTHONPATH=src python -m pytest tests -q
 ```
 
-Tests cover the `/opp` command parser, the service layer (CRUD,
-multi-user isolation, stage transitions, soft-delete), and the
-formatters (cards, markdown table, CSV export shape with escaped
-quotes/commas/newlines).
+Tests cover the message router end to end (capture, commands, buttons,
+secretary scoping) against a real SQLite file, the scheduler across a
+restart, the time parser, the secretary/invite lifecycle, the DB
+migration, and the Slack adapter and formatter.
 
 ## Supported Time Expressions
 
-**English:**
-- `at 4pm`, `by 3pm`, `at 10:30`
-- `in 2 hours`, `in 30 minutes`, `in 5 mins`
-- `tomorrow`, `tomorrow 9am`
-- `next Monday`, `next week`
-- `remind me to X [time]`, `remind me at [time]`
+Clock times are read in your configured `timezone`. A day named without
+a time means 9am; a clock time that has already passed today means
+tomorrow.
 
-**Chinese:**
-- `明天下午4點` (tomorrow 4pm)
-- `今天早上9點` (today 9am)
-- `下午3點` (3pm)
-- `5分鐘後` (in 5 minutes)
-- `1小時後` (in 1 hour)
+**English:**
+- `at 4pm`, `by 3pm`, `at 10:30`, `at noon`
+- `in 2 hours`, `in 30 minutes`, `in 5 mins`, `in half an hour`
+- `tomorrow`, `tomorrow 9am`, `tonight at 8`
+- `next Monday`, `on Friday`, `next week`, `at 4pm on Friday`
+- `on 5 Dec`, `December 12 at 3pm`
+- `remind me to X [time]`, `remind me [time] to X`
+
+**Chinese (Traditional and Simplified):**
+- `明天下午4點` (tomorrow 4pm), `今天早上9點` (today 9am), `下午3點`, `3點半`
+- `5分鐘後` (in 5 minutes), `1小時後` (in 1 hour), `2天後` (in 2 days)
 - `提醒我...`, `幫我提醒...`, `提醒一下...`
+
+Without a `remind me` / `提醒我` phrase, an English time is only
+recognised at the **end** of the message (`Call dentist at 4pm`), so
+ordinary notes aren't misread. Anything with no time repeats every
+`default_interval_hours`.
 
 ## Configuration Reference
 
@@ -302,35 +260,44 @@ Full list of timezone names: [Wikipedia — List of tz database time zones](http
 from platforms.base import BasePlatform
 
 class MyPlatform(BasePlatform):
-    async def send_message(self, chat_id: str, text: str) -> None: ...
-    async def send_reminder(self, chat_id: str, content: str, reminder_id: int) -> None: ...
-    async def run(self) -> None: ...
+    name = "myplatform"
+
+    def __init__(self, cfg, on_message): ...
+    def identity_for(self, canonical_chat_id: str) -> str | None: ...   # None = can't reach this user
+    async def send_html(self, canonical_chat_id: str, text: str) -> None: ...
+    async def send_reminder(self, canonical_chat_id: str, content: str, reminder_id: int) -> None: ...
+    async def wait_ready(self) -> None: ...   # optional: return once sends will work
+    async def run(self) -> None: ...          # listen forever
 ```
 
-2. Register it in `src/platforms/__init__.py`
-3. Add credentials to `config.example.yaml`
-4. Set `platform: <name>` in your `config.yaml`
+   Incoming messages go to `await on_message(canonical_chat_id, text, first_name)`;
+   button presses go in as `/callback done:<id>`, `/callback delete:<id>` or
+   `/callback snooze:<hours>:<id>`. The reply is either an HTML string
+   (empty = stay silent) or `{"kind": "reminder_cards", "header": ..., "items": [...]}`.
+
+2. Register it in `_instantiate()` in `src/platforms/__init__.py`
+3. Add a config dataclass in `src/config.py` and credentials to `config.example.yaml`
+4. Add `<name>` to `platforms:` in your `config.yaml`
 
 ## Project Structure
 
 ```
 ├── src/
-│   ├── main.py              # central router (reminders, /opp, /invite, callbacks)
+│   ├── main.py              # central router (reminders, commands, callbacks)
 │   ├── config.py            # config loader
-│   ├── database.py          # SQLAlchemy models (Thought / Reminder / Opportunity
-│   │                        #   / OpportunityUpdate / Secretary / Invite / SecretaryEvent)
+│   ├── database.py          # SQLAlchemy models (Thought / Reminder / Secretary
+│   │                        #   / Invite / SecretaryEvent)
 │   ├── migrations.py        # idempotent SQLite migrations (ALTER TABLE + backup)
 │   ├── secretary.py         # resolve_owner, invite lifecycle, format_actor, audit
-│   ├── scheduler.py         # APScheduler wrapper
-│   ├── time_parser.py       # NLP time extraction (EN + ZH)
-│   ├── opp.py               # /opp parser, service, formatters (cards/md/CSV)
-│   ├── dispatcher.py       # fans cross-platform sends out (reminders, owner notifs)
+│   ├── scheduler.py         # APScheduler wrapper (persistent jobs, UTC)
+│   ├── time_parser.py       # time extraction (EN + ZH)
+│   ├── dispatcher.py        # fans cross-platform sends out (reminders, owner notifs)
 │   └── platforms/
-│       ├── base.py         # abstract platform interface
-│       ├── telegram.py     # Telegram implementation
-│       ├── slack.py        # Slack implementation (Socket Mode + Block Kit)
+│       ├── base.py          # abstract platform interface
+│       ├── telegram.py      # Telegram implementation
+│       ├── slack.py         # Slack implementation (Socket Mode + Block Kit)
 │       └── _slack_format.py # HTML → Slack mrkdwn conversion
-├── tests/                   # pytest suite (96 tests)
+├── tests/                   # pytest suite
 ├── config.example.yaml
 ├── requirements.txt
 ├── requirements-dev.txt
@@ -352,12 +319,18 @@ will:
 All steps are idempotent — restarting the bot doesn't repeat them. If
 you ever need to roll back, swap the backup file in for the live DB.
 
+The sales-opportunity tracker (`/opp`) has been removed. Databases that
+used it still contain the `opportunities` and `opportunity_updates`
+tables; the bot no longer reads or writes them and never drops them. If
+you want the space back: `sqlite3 data/reminders.db "DROP TABLE
+opportunity_updates; DROP TABLE opportunities;"`.
+
 ## Tech Stack
 
 - [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) v21
 - [APScheduler](https://apscheduler.readthedocs.io/) v3 — job persistence via SQLite
 - [SQLAlchemy](https://www.sqlalchemy.org/) v2 — ORM
-- [dateparser](https://dateparser.readthedocs.io/) — multilingual time parsing
+- [dateparser](https://dateparser.readthedocs.io/) — fallback for dates the built-in patterns don't cover
 - Docker + Docker Compose
 
 ## License
