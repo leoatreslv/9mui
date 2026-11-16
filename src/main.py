@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timedelta
 from html import escape
 
-__version__ = "0.1"
+__version__ = "0.2"
 
 import pytz
 from config import load_config

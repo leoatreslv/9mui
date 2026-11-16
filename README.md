@@ -1,6 +1,6 @@
 # 9Mui — Personal Reminder Bot
 
-![Version](https://img.shields.io/badge/version-0.1-blue)
+![Version](https://img.shields.io/badge/version-0.2-blue)
 ![Docker Pulls](https://img.shields.io/docker/pulls/wongleo/reminder-bot)
 
 A self-hosted thought-capture and reminder bot. Send it anything you want to remember — it stores it and reminds you at the right time. Runs on Telegram and/or Slack (concurrently), deployed via Docker.
